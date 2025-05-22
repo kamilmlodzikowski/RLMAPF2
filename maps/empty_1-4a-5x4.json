@@ -1,0 +1,79 @@
+{
+    "metadata": {
+        "name": "empty",
+        "min_num_of_agents": 1,
+        "max_num_of_agents": 4,
+        "width": 5,
+        "height": 4
+    },
+    "map_raw": [
+        "XXXXX",
+        "X   X",
+        "X   X",
+        "XXXXX"
+    ],
+    "map_variant": {
+        "0": {
+            "obstacles": [
+                [
+                    0,
+                    0
+                ],
+                [
+                    1,
+                    0
+                ],
+                [
+                    2,
+                    0
+                ],
+                [
+                    3,
+                    0
+                ],
+                [
+                    4,
+                    0
+                ],
+                [
+                    0,
+                    1
+                ],
+                [
+                    4,
+                    1
+                ],
+                [
+                    0,
+                    2
+                ],
+                [
+                    4,
+                    2
+                ],
+                [
+                    0,
+                    3
+                ],
+                [
+                    1,
+                    3
+                ],
+                [
+                    2,
+                    3
+                ],
+                [
+                    3,
+                    3
+                ],
+                [
+                    4,
+                    3
+                ]
+            ],
+            "starting_positions": {},
+            "goal_positions": {}
+        }
+    }
+}

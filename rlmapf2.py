@@ -38,6 +38,7 @@ class RLMAPF(MultiAgentEnv):
         if self.config["observation_size"] % 2 == 0:
             raise ValueError("Observation size must be odd")
         self.observation_size = self.config["observation_size"]
+        self.use_d_star_lite = self.config["use_d_star_lite"]
 
         # Set seed
         if self.config["seed"] is not None:
@@ -58,6 +59,16 @@ class RLMAPF(MultiAgentEnv):
         else:
             self.action_space = gym.spaces.Discrete(5)
         
+        # Initialize last_actions to track agent movement directions
+        self.last_actions = {}
+
+        # Initialize D* Lite-related variables only if enabled
+        if self.use_d_star_lite:
+            self.d_star_maps = {}
+            self.d_star_paths = {}
+            self.start_d_star_paths = {}
+            self.d_stars = {}
+
         super().__init__()
 
     def get_default_config(self):
@@ -94,18 +105,33 @@ class RLMAPF(MultiAgentEnv):
             "penalize_waiting": True,
             "penalize_steps": True,
             "reward_closer_to_goal_each_step": False,
+            "reward_closer_to_goal_final": False,
             "reward_final_d_star": True,
+            "use_d_star_lite": True,  # Enable or disable D* Lite
         }
         return default_config
 
     def define_observation_spaces(self):
         if self.observation_type == 'array':
-            self.observation_space = gym.spaces.Dict({
-                'd_star_path': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
-                'distance_to_goal': gym.spaces.Box(low=-self.grid_size[0], high=self.grid_size[0], shape=(2,), dtype=int),
-                'agents_positions': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
-                'obstacles': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
-            })
+            # self.observation_space = gym.spaces.Dict({
+            #     'd_star_path': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+            #     'distance_to_goal': gym.spaces.Box(low=-self.grid_size[0], high=self.grid_size[0], shape=(2,), dtype=int),
+            #     'agents_positions': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+            #     'obstacles': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+            # })
+            if self.use_d_star_lite:
+                self.observation_space = gym.spaces.Dict({
+                    'd_star_path': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+                    'distance_to_goal': gym.spaces.Box(low=-self.grid_size[0], high=self.grid_size[0], shape=(2,), dtype=int),
+                    'agents_positions': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+                    'obstacles': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+                })
+            else:
+                self.observation_space = gym.spaces.Dict({
+                    'distance_to_goal': gym.spaces.Box(low=-self.grid_size[0], high=self.grid_size[0], shape=(2,), dtype=int),
+                    'agents_positions': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+                    'obstacles': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+                })
         else:
             raise ValueError("Invalid observation type: {}".format(self.observation_type))
 
@@ -166,19 +192,20 @@ class RLMAPF(MultiAgentEnv):
             for agent in self._agent_ids:
                 self.goal_positions[agent] = self._random_pos()
 
-        # Init D* Lite
-        self.d_star_maps = {agent: OccupancyGridMap(self.grid_size[0], self.grid_size[1]) for agent in self._agent_ids}
-        self.d_star_paths = {agent: [] for agent in self._agent_ids}
-        obstacles_array = np.zeros(self.grid_size, dtype=int)
-        for pos in self.obstacles:
-            obstacles_array[pos] = 255
-        for agent in self._agent_ids:
-            self.d_star_maps[agent].set_map(obstacles_array)
-        self.d_stars = {agent: DStarLite(self.d_star_maps[agent], self.agent_positions[agent], self.goal_positions[agent]) for agent in self._agent_ids}
-        for agent in self._agent_ids:
-            path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
-            self.d_star_paths[agent] = path
-        self.start_d_star_paths = deepcopy(self.d_star_paths)
+        # Init D* Lite only if enabled
+        if self.use_d_star_lite:
+            self.d_star_maps = {agent: OccupancyGridMap(self.grid_size[0], self.grid_size[1]) for agent in self._agent_ids}
+            self.d_star_paths = {agent: [] for agent in self._agent_ids}
+            obstacles_array = np.zeros(self.grid_size, dtype=int)
+            for pos in self.obstacles:
+                obstacles_array[pos] = 255
+            for agent in self._agent_ids:
+                self.d_star_maps[agent].set_map(obstacles_array)
+            self.d_stars = {agent: DStarLite(self.d_star_maps[agent], self.agent_positions[agent], self.goal_positions[agent]) for agent in self._agent_ids}
+            for agent in self._agent_ids:
+                path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
+                self.d_star_paths[agent] = path
+            self.start_d_star_paths = deepcopy(self.d_star_paths)
 
         # Render
         if self.render_mode == "human":
@@ -322,10 +349,11 @@ class RLMAPF(MultiAgentEnv):
         # Update agent positions
         self.agent_positions = new_state
 
-        # Update D* Lite
-        for agent in self._agent_ids:
-            path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
-            self.d_star_paths[agent] = path
+        # Update D* Lite paths only if enabled
+        if self.use_d_star_lite:
+            for agent in self._agent_ids:
+                path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
+                self.d_star_paths[agent] = path
 
         for agent, new_pos in self.agent_positions.items():
             # Check for reaching goal positions and update rewards
@@ -343,9 +371,8 @@ class RLMAPF(MultiAgentEnv):
         truncateds = {agent: self.steps >= self.max_steps for agent in self._agent_ids}
         truncateds['__all__'] = self.steps >= self.max_steps
 
-        # Penalize according to D* distance to goal / D* distance to goal at start
-        # REWARD FINAL D* DISTANCE
-        if self.config["reward_final_d_star"]:
+        # Reward based on D* Lite distance only if enabled
+        if self.use_d_star_lite and self.config["reward_final_d_star"]:
             for agent in self._agent_ids:
                 if truncateds[agent]:
                     d_star_distance_current = len(self.d_star_paths[agent])
@@ -353,6 +380,13 @@ class RLMAPF(MultiAgentEnv):
 
                     d_star_reward = 1.0 - d_star_distance_current / d_star_distance_start
                     reward(agent, reward=d_star_reward)
+
+        # Reward for being closer to goal final
+        if self.config["reward_closer_to_goal_final"]:
+            for agent in self._agent_ids:
+                if truncateds[agent]:
+                    distance_to_goal = np.linalg.norm(np.array(self.goal_positions[agent]) - np.array(self.agent_positions[agent]))
+                    reward(agent, reward=1.0 - distance_to_goal / (self.grid_size[0] + self.grid_size[1]))
 
         # Render
         if self.render_mode == "human":
@@ -432,24 +466,6 @@ class RLMAPF(MultiAgentEnv):
         return observations
     
     def _get_array_observations(self):
-        # Goal position arrays from D* Lite
-        d_star_path_arrays = {agent: np.zeros((self.observation_size, self.observation_size), dtype=int) for agent in self._agent_ids}
-        for agent, path in self.d_star_paths.items():
-            if agent not in self._agent_ids:
-                continue
-            
-            array = np.zeros(self.grid_size, dtype=int)
-            for i, pos in enumerate(path):
-                array[pos] = i
-
-            # Crop d_star_path_arrays to observation_size around agent
-            x, y = self.agent_positions[agent]
-            array = self.crop_array(array, x, y, self.observation_size, pad_value=0)
-
-            # Turn everything into 0 or 1
-            array[array != 0] = 1
-            d_star_path_arrays[agent] = array
-
         # Distance in x and y to goal
         distance_to_goal = {agent: np.zeros(2, dtype=int) for agent in self._agent_ids}
         for agent, pos in self.agent_positions.items():
@@ -461,7 +477,7 @@ class RLMAPF(MultiAgentEnv):
             for agent2, pos in self.agent_positions.items():
                 if agent2 != agent:
                     agents_positions_arrays[agent][pos] = 1
-        # Crop agent_positions_arrays to observation_size around agent
+        # Crop agent_positionsArrays to observation_size around agent
         for agent, array in agents_positions_arrays.items():
             x, y = self.agent_positions[agent]
             agents_positions_arrays[agent] = self.crop_array(array, x, y, self.observation_size, pad_value=0)
@@ -479,15 +495,43 @@ class RLMAPF(MultiAgentEnv):
             x, y = self.agent_positions[agent]
             obstacles_array[agent] = self.crop_array(array, x, y, self.observation_size, pad_value=0)
 
-            
+        # Include D* Lite paths only if enabled
+        if self.use_d_star_lite:
+            d_star_path_arrays = {agent: np.zeros((self.observation_size, self.observation_size), dtype=int) for agent in self._agent_ids}
+            for agent, path in self.d_star_paths.items():
+                if agent not in self._agent_ids:
+                    continue
+                
+                array = np.zeros(self.grid_size, dtype=int)
+                for i, pos in enumerate(path):
+                    array[pos] = i
+
+                # Crop d_star_path_arrays to observation_size around agent
+                x, y = self.agent_positions[agent]
+                array = self.crop_array(array, x, y, self.observation_size, pad_value=0)
+
+                # Turn everything into 0 or 1
+                array[array != 0] = 1
+                d_star_path_arrays[agent] = array
+        else:
+            d_star_path_arrays = None
+
         observations = dict()
         for agent in self._agent_ids:
-            observations[agent] = {
-                'd_star_path': d_star_path_arrays[agent], 
-                'distance_to_goal': distance_to_goal[agent],
-                'agents_positions': agents_positions_arrays[agent],
-                'obstacles': obstacles_array[agent]
-            }
+            if self.use_d_star_lite:
+                observations[agent] = {
+                    # Include D* Lite paths only if enabled
+                    **({'d_star_path': d_star_path_arrays[agent]} if self.use_d_star_lite else {}),
+                    'distance_to_goal': distance_to_goal[agent],
+                    'agents_positions': agents_positions_arrays[agent],
+                    'obstacles': obstacles_array[agent]
+                }
+            else:
+                observations[agent] = {
+                    'distance_to_goal': distance_to_goal[agent],
+                    'agents_positions': agents_positions_arrays[agent],
+                    'obstacles': obstacles_array[agent]
+                }
         return observations
     
     def get_agent_ids(self) -> set:
@@ -552,7 +596,8 @@ class RLMAPF(MultiAgentEnv):
                 rect = Rectangle((pos[0], pos[1]), 1, 1, color="green")
             self._ax.add_patch(rect)
             self._patches.append(rect)
-            text = self._ax.text(pos[0] + 0.5, pos[1] + 0.5, agent_nr, color="white", ha="center", va="center", zorder=1)
+            text_size = 6 if len(agent_nr) > 1 else 8  # Adjust text size for double-digit numbers
+            text = self._ax.text(pos[0] + 0.5, pos[1] + 0.45, agent_nr, color="white", ha="center", va="center", zorder=1, fontsize=text_size)
             self._texts.append(text)
         
         # Draw agents
@@ -562,11 +607,12 @@ class RLMAPF(MultiAgentEnv):
                 rect = Circle((pos[0] + 0.5, pos[1] + 0.5), 0.4, facecolor="yellow", edgecolor="black")
                 self._ax.add_patch(rect)
                 self._patches.append(rect)
-                text = self._ax.text(pos[0] + 0.5, pos[1] + 0.5, agent_nr, color="black", ha="center", va="center")
+                text_size = 6 if len(agent_nr) > 1 else 8  # Adjust text size for double-digit numbers
+                text = self._ax.text(pos[0] + 0.5, pos[1] + 0.45, agent_nr, color="black", ha="center", va="center", fontsize=text_size)
                 self._texts.append(text)
+                    
 
         # Add legend
-        # print(include_legend)
         if not hasattr(self, "_legend_text_obj") and include_legend:
             legend_text = (
                 "Legend:\n"

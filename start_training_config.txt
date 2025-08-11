@@ -1,0 +1,10 @@
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+--agents_num 20 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True

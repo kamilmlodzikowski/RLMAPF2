@@ -1,1 +1,9 @@
 frames/*
+*results*
+*checkpoint*
+*.pkl
+*.pt
+*.pyc*
+*.log
+wandb
+__pycache__

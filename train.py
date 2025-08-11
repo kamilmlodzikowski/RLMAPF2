@@ -13,18 +13,19 @@ import sys
 import wandb
 import time
 from random import randint
+import argparse
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Config
-TRAINING_EPISODES = 2000  # Number of episodes to train for
+TRAINING_EPISODES = 1200  # Number of episodes to train for
 # TRAINING_EPISODES = 5000
 COCURRENT_TRAININGS = 1  # Number of trainings that will be run in parallel
 NUM_CPUS = 4  # Number of CPU cores available
 NUM_GPUS = 1  # Number of GPUs available
-SAVE_PATH = "/home/kamil/Documents/RLMAPF/saved_models"
+SAVE_PATH = "/home/kamil/Documents/RLMAPF2/saved_models"
 SAVE_INTERVAL = 500  # Save the model every SAVE_INTERVAL episodes
 EVAL_INTERVAL = 50  # Evaluate the model every EVAL_INTERVAL episodes
 
@@ -35,7 +36,7 @@ OBSERVATION_TYPE = 'array'
 
 # WandB setup
 USE_WANDB = True  # If True, will use Weights and Biases for logging
-WANDB_GROUP = "No-D-star-20"  # Group name for Weights and Biases
+# WANDB_GROUP = "No-D-star-20"  # Group name for Weights and Biases
 
 TAGS = ["agents_"+str(AGENTS_NUM), 
         "basic_PPO", 
@@ -73,6 +74,55 @@ try:
     run_name = "run_"+str(randint(0, 1000))+'_' + str(time.strftime("%d-%m-%Y_%H-%M-%S"))
     print("Run name: {0}".format(run_name))
 
+    
+
+    def configure_env(agents_num=20, maps_names_with_variants=None, max_steps=250, 
+                      reward_closer_to_goal_final=True, reward_final_d_star=False, 
+                      use_d_star_lite=False):
+        """Configure the default environment with passed parameters."""
+        return {
+            "agents_num": agents_num,
+            "render_mode": "none",
+            "render_delay": 0.01,
+            "map_path": "/home/kamil/Documents/RLMAPF2/maps",
+            "maps_names_with_variants": maps_names_with_variants or {
+                "pprai_1-20a-42x39": None,
+            },
+            "max_steps": max_steps,
+            "collision_penalty": 0.1,
+            "step_cost": 0.02,
+            "wait_cost_multiplier": 2,
+            "goal_reward": 10,
+            "observation_type": OBSERVATION_TYPE,
+            "predict_distance": False,
+            "penalize_collision": True,
+            "penalize_waiting": True,
+            "penalize_steps": True,
+            "reward_closer_to_goal_each_step": False,
+            "reward_closer_to_goal_final": reward_closer_to_goal_final,
+            "reward_final_d_star": reward_final_d_star,
+            "reward_low_density": False,
+            "use_d_star_lite": use_d_star_lite,
+        }
+
+    def parse_arguments():
+        """Parse command-line arguments for environment configuration."""
+        parser = argparse.ArgumentParser(description="Train PPO with configurable environment.")
+        parser.add_argument("--agents_num", type=int, default=20, help="Number of agents.")
+        parser.add_argument("--maps_names_with_variants", type=str, nargs="*", default=["pprai_1-20a-42x39"], help="Map names with variants.")
+        parser.add_argument("--max_steps", type=int, default=250, help="Maximum steps per episode.")
+        parser.add_argument("--reward_closer_to_goal_final", type=bool, default=True, help="Reward closer to goal at final step.")
+        parser.add_argument("--reward_final_d_star", type=bool, default=False, help="Reward based on D* Lite.")
+        parser.add_argument("--use_d_star_lite", type=bool, default=False, help="Use D* Lite algorithm.")
+        return parser.parse_args()
+
+    # Parse arguments
+    args = parse_arguments()
+
+    # Dynamically set WANDB_GROUP based on use_d_star_lite
+    WANDB_GROUP = "D-star" if args.use_d_star_lite else "No-D-star"
+    WANDB_GROUP += "_" + str(args.agents_num)
+
     # Ray initialization
     context = ray.init(
         num_cpus=NUM_CPUS,
@@ -102,60 +152,42 @@ try:
                 # "use_lstm": True,  
             },
         )
-        .environment(RLMAPF, env_config={
-            "agents_num": AGENTS_NUM,
-            "render_mode": "none",
-            "render_delay": 0.01,
-            "map_path": "/home/kamil/Documents/RLMAPF/maps",
-            "maps_names_with_variants": {
-                "pprai_1-20a-42x39": None,
-                # "medium_1-50a-51x21": None,
-                # "warehouse0_1-10a-21x21": None,
-            },
-            "max_steps": 250,
-            "collision_penalty": 0.1,
-            "step_cost": 0.02,
-            "wait_cost_multiplier": 2,
-            "goal_reward": 10,
-            "observation_type": OBSERVATION_TYPE,
-            "predict_distance": False,
-            "penalize_collision": True,
-            "penalize_waiting": True,
-            "penalize_steps": True,
-            "reward_closer_to_goal_each_step": False,
-            "reward_final_d_star": True,
-            "reward_low_density": False,})
+        .environment(RLMAPF, env_config=configure_env(
+            agents_num=args.agents_num,
+            maps_names_with_variants={name: None for name in args.maps_names_with_variants},
+            max_steps=args.max_steps,
+            reward_closer_to_goal_final=args.reward_closer_to_goal_final,
+            reward_final_d_star=args.reward_final_d_star,
+            use_d_star_lite=args.use_d_star_lite
+        ))
         .evaluation(
             evaluation_interval=EVAL_INTERVAL,
             evaluation_duration=10,
             # evaluation_force_reset_envs_before_iteration=True,
-            evaluation_config={"env_config": 
-                {
-                    "agents_num": AGENTS_NUM,
-                    "render_mode": "none",
-                    "render_delay": 0.01,
-                    "seed": 42,
-                    "map_path": "/home/kamil/Documents/RLMAPF/maps",
-                    "maps_names_with_variants": {
-                        "pprai_1-20a-42x39": None,
-                        # "medium_1-50a-51x21": None,
-                        # "warehouse0_1-10a-21x21": None,
-                    },
-                    "max_steps": 200,
-                    "collision_penalty": 0.1,
-                    "step_cost": 0.01,
-                    "wait_cost_multiplier": 2,
-                    "goal_reward": 10,
-                    "observation_type": OBSERVATION_TYPE,
-                    "predict_distance": False,
-                    "penalize_collision": True,
-                    "penalize_waiting": True,
-                    "penalize_steps": True,
-                    "reward_closer_to_goal_each_step": False,
-                    "reward_final_d_star": True,
-                    "reward_low_density": False,
-                }
-            }
+            evaluation_config={"env_config": {
+                "agents_num": AGENTS_NUM,
+                "render_mode": "none",
+                "render_delay": 0.01,
+                "seed": 42,
+                "map_path": "/home/kamil/Documents/RLMAPF/maps",
+                "maps_names_with_variants": {
+                    "pprai_1-20a-42x39": None,
+                },
+                "max_steps": 200,
+                "collision_penalty": 0.1,
+                "step_cost": 0.01,
+                "wait_cost_multiplier": 2,
+                "goal_reward": 10,
+                "observation_type": OBSERVATION_TYPE,
+                "predict_distance": False,
+                "penalize_collision": True,
+                "penalize_waiting": True,
+                "penalize_steps": True,
+                "reward_closer_to_goal_each_step": False,
+                "reward_closer_to_goal_final": True,
+                "reward_final_d_star": False,
+                "reward_low_density": False,
+            }}
         )
         # .training(
         #     # clip_param=0.1,
@@ -173,7 +205,7 @@ try:
         # WandB setup
     run = wandb.init(
         # project="RLMAPF_new_test",
-        project = "rlmapf_limited_pprai",
+        project = "rlmapf_limited_icra",
         group=WANDB_GROUP,
         tags=TAGS,
         notes="",

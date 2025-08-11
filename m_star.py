@@ -183,7 +183,8 @@ def astar_single(start: Pos, goal: Pos,
             # Dynamic conflicts: vertex & edge
             if nxt in dynamic_obstacles.get(t_next, set()):
                 continue
-            if (nxt == prev and current in dynamic_obstacles.get(t_next, set())):
+            if (current in dynamic_obstacles.get(t_next, set()) and
+                    nxt in dynamic_obstacles.get(g, set())):
                 continue  # edge swap with another agent
 
             key = (nxt, t_next)

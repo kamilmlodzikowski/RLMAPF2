@@ -14,15 +14,13 @@ import wandb
 import time
 from random import randint
 import argparse
-import os
-from pathlib import Path
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Config
-TRAINING_EPISODES = 500  # Number of episodes to train for
+TRAINING_EPISODES = 1200  # Number of episodes to train for
 # TRAINING_EPISODES = 5000
 COCURRENT_TRAININGS = 1  # Number of trainings that will be run in parallel
 NUM_CPUS = 4  # Number of CPU cores available
@@ -71,7 +69,7 @@ try:
 
     
 
-    def configure_env(agents_num=20, max_steps=250, 
+    def configure_env(agents_num=20, maps_names_with_variants=None, max_steps=250, 
                       reward_closer_to_goal_final=True, reward_final_d_star=False, 
                       use_d_star_lite=False, use_cnn_observation=False):
         """Configure the default environment with passed parameters."""
@@ -80,9 +78,8 @@ try:
             "render_mode": "none",
             "render_delay": 0.01,
             "map_path": "/home/kamil/Documents/RLMAPF2/maps",
-            "maps_names_with_variants":{
-                # "pprai_1-20a-42x39": None,
-                "big_empty_1-100a-20x20": None,
+            "maps_names_with_variants": maps_names_with_variants or {
+                "pprai_1-20a-42x39": None,
                 # "right_hand4_4-4a-9x17": None
                 # "right_hand2_2-2a-9x14": None
             },
@@ -92,6 +89,7 @@ try:
             "wait_cost_multiplier": 2,
             "goal_reward": 10,
             "observation_type": OBSERVATION_TYPE,
+            "predict_distance": False,
             "penalize_collision": True,
             "penalize_waiting": True,
             "penalize_steps": True,
@@ -99,7 +97,7 @@ try:
             "reward_closer_to_goal_final": reward_closer_to_goal_final,
             "reward_final_d_star": reward_final_d_star,
             "reward_low_density": False,
-            "penalize_left_side_bottom_passing": True,
+            "reward_right_side_passing": True,
             "use_d_star_lite": use_d_star_lite,
             "use_cnn_observation": use_cnn_observation,
         }
@@ -108,6 +106,7 @@ try:
         """Parse command-line arguments for environment configuration."""
         parser = argparse.ArgumentParser(description="Train PPO with configurable environment.")
         parser.add_argument("--agents_num", type=int, default=20, help="Number of agents.")
+        parser.add_argument("--maps_names_with_variants", type=str, nargs="*", default=["pprai_1-20a-42x39"], help="Map names with variants.")
         parser.add_argument("--max_steps", type=int, default=250, help="Maximum steps per episode.")
         parser.add_argument("--reward_closer_to_goal_final", type=bool, default=True, help="Reward closer to goal at final step.")
         parser.add_argument("--reward_final_d_star", type=bool, default=False, help="Reward based on D* Lite.")
@@ -121,8 +120,7 @@ try:
     # Dynamically set WANDB_GROUP based on use_d_star_lite
     # WANDB_GROUP = "D-star" if args.use_d_star_lite else "No-D-star"
     # WANDB_GROUP += "_" + str(args.agents_num)
-    WANDB_GROUP = "CNN-dont-include-others-D-star-penalize-left-40-agents" 
-    PROJECT_NAME = "rlmapf_big_empty"
+    WANDB_GROUP = "CNN-include-others-D-star" 
 
     # Ray initialization
     context = ray.init(
@@ -170,6 +168,7 @@ try:
         .training(model=model_config)
         .environment(RLMAPF, env_config=configure_env(
             agents_num=args.agents_num,
+            maps_names_with_variants={name: None for name in args.maps_names_with_variants},
             max_steps=args.max_steps,
             reward_closer_to_goal_final=args.reward_closer_to_goal_final,
             reward_final_d_star=args.reward_final_d_star,
@@ -185,10 +184,9 @@ try:
                 "render_mode": "none",
                 "render_delay": 0.01,
                 "seed": 42,
-                "map_path": "/home/kamil/Documents/RLMAPF2/maps",
+                "map_path": "/home/kamil/Documents/RLMAPF/maps",
                 "maps_names_with_variants": {
-                    # "pprai_1-20a-42x39": None,
-                    "big_empty_1-100a-20x20": None,
+                    "pprai_1-20a-42x39": None,
                 },
                 "max_steps": 200,
                 "collision_penalty": 0.1,
@@ -196,6 +194,7 @@ try:
                 "wait_cost_multiplier": 2,
                 "goal_reward": 10,
                 "observation_type": OBSERVATION_TYPE,
+                "predict_distance": False,
                 "penalize_collision": True,
                 "penalize_waiting": True,
                 "penalize_steps": True,
@@ -205,7 +204,6 @@ try:
                 "reward_low_density": False,
                 "use_d_star_lite": args.use_d_star_lite,
                 "use_cnn_observation": args.use_cnn_observation,
-                "penalize_left_side_bottom_passing": False,
             }}
         )
         # .training(
@@ -225,7 +223,7 @@ try:
     run = wandb.init(
         # project="RLMAPF_new_test",
         # project = "rlmapf_limited_icra",
-        project=PROJECT_NAME,
+        project="rlmapf_others_d_star",
         group=WANDB_GROUP,
         # tags=TAGS,
         notes="",
@@ -322,73 +320,6 @@ try:
         # Log model path to wandb
         wandb.log({"model_path": SAVE_PATH + "/model_" + run_name + "_final"})
     
-    # Record an MP4 rollout of the trained policy
-    try:
-        # Build safe filename from project and group
-        def _safe_name(s: str) -> str:
-            return str(s).replace(os.sep, "_").replace(" ", "_")
-
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        video_filename = f"{_safe_name(PROJECT_NAME)}__{_safe_name(WANDB_GROUP)}__{timestamp}.mp4"
-        project_root = Path(__file__).resolve().parent
-        video_dir = project_root / "videos"
-        os.makedirs(video_dir, exist_ok=True)
-        video_path = str(video_dir / video_filename)
-
-        # Configure a rendering env matching training, with video saving enabled
-        render_env_config = configure_env(
-            agents_num=args.agents_num,
-            max_steps=args.max_steps,
-            reward_closer_to_goal_final=args.reward_closer_to_goal_final,
-            reward_final_d_star=args.reward_final_d_star,
-            use_d_star_lite=args.use_d_star_lite,
-            use_cnn_observation=args.use_cnn_observation,
-        )
-        render_env_config.update({
-            "render_mode": "human",
-            "render_config": {
-                "title": f"{PROJECT_NAME} / {WANDB_GROUP}",
-                "show_render": False,
-                "save_video": True,
-                "include_legend": True,
-                "legend_position": (0, 0),
-                "video_path": video_path,
-                "video_fps": 3,
-                "video_dpi": 300,
-                "render_delay": 0.0,
-                "save_frames": False,
-                "frames_path": "frames/",
-            },
-        })
-
-        env_for_video = RLMAPF(render_env_config)
-        obs, _ = env_for_video.reset(seed=42)
-        terminateds = {"__all__": False}
-        truncateds = {"__all__": False}
-
-        while not terminateds["__all__"] and not truncateds["__all__"]:
-            actions = {}
-            for agent_id in list(env_for_video._agent_ids):
-                # Compute action with the trained policy (deterministic)
-                act = algorithm.compute_single_action(obs[agent_id], explore=False)
-                if isinstance(act, tuple):
-                    act = act[0]
-                actions[agent_id] = int(act)
-
-            obs, _, terminateds, truncateds, _ = env_for_video.step(actions)
-
-        # Finalize video if writer exists
-        if hasattr(env_for_video, "_video_writer") and env_for_video._video_writer is not None:
-            try:
-                env_for_video._video_writer.finish()
-            except Exception:
-                pass
-
-        print(f"Saved rollout video to: {video_path}")
-        if USE_WANDB:
-            wandb.log({"rollout_video_path": video_path})
-    except Exception as video_err:
-        print(f"Failed to record MP4: {video_err}")
 
     # Print best results
     print("Best results:")

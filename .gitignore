@@ -5,5 +5,8 @@ frames/*
 *.pt
 *.pyc*
 *.log
+*.mp4
+*.avi
+*.gif
 wandb
 __pycache__

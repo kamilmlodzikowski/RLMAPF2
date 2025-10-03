@@ -34,6 +34,7 @@ class RLMAPF(MultiAgentEnv):
         self.render_mode = self.config["render_mode"]
         self.render_config = self.config["render_config"]
         self.observation_type = self.config["observation_type"]
+        self.predict_distance = self.config["predict_distance"]
         if self.config["observation_size"] % 2 == 0:
             raise ValueError("Observation size must be odd")
         self.observation_size = self.config["observation_size"]
@@ -53,7 +54,10 @@ class RLMAPF(MultiAgentEnv):
         
         # Define agent observation and action spaces
         self.define_observation_spaces()
-        self.action_space = gym.spaces.Discrete(5)
+        if self.predict_distance:
+            self.action_space = gym.spaces.Tuple([gym.spaces.Discrete(5), gym.spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)])
+        else:
+            self.action_space = gym.spaces.Discrete(5)
         
         # Initialize last_actions to track agent movement directions
         self.last_actions = {}
@@ -100,7 +104,7 @@ class RLMAPF(MultiAgentEnv):
             },
             "step_cost": 0.0,
             "wait_cost_multiplier": 2,
-            # Removed predict_distance support
+            "predict_distance": False,
             "penalize_collision": True,
             "penalize_waiting": True,
             "penalize_steps": True,
@@ -108,7 +112,7 @@ class RLMAPF(MultiAgentEnv):
             "reward_closer_to_goal_final": False,
             "reward_final_d_star": True,
             "use_d_star_lite": True,  # Enable or disable D* Lite
-            "penalize_left_side_bottom_passing": False,  # Penalize left-side/bottom passing
+            "reward_right_side_passing": False,  # Encourage right-side/top passing
         }
         return default_config
 
@@ -118,8 +122,7 @@ class RLMAPF(MultiAgentEnv):
                 # Stack grid-based features into channels for CNN consumption.
                 # Channels: obstacles, agents_positions, and optionally
                 # d_star_path, d_star_path_others when D* Lite is enabled.
-                # channels = 2 + (2 if self.use_d_star_lite else 0) 
-                channels = 3 if self.use_d_star_lite else 2 # NO OTHER D* PATHS, CHANGE BACK TO 4
+                channels = 2 + (2 if self.use_d_star_lite else 0)
                 self.observation_space = gym.spaces.Dict({
                     'grid': gym.spaces.Box(
                         low=0.0, high=1.0,
@@ -127,7 +130,7 @@ class RLMAPF(MultiAgentEnv):
                         dtype=np.float32,
                     ),
                     'distance_to_goal': gym.spaces.Box(
-                        low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+                        low=-self.grid_size[0], high=self.grid_size[0], shape=(2,), dtype=int
                     ),
                 })
             else:
@@ -136,15 +139,15 @@ class RLMAPF(MultiAgentEnv):
                     self.observation_space = gym.spaces.Dict({
                         'd_star_path': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
                         'd_star_path_others': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
-                        'distance_to_goal': gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
-                        'agents_positions': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
-                        'obstacles': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
+                        'distance_to_goal': gym.spaces.Box(low=-self.grid_size[0], high=self.grid_size[0], shape=(2,), dtype=int),
+                        'agents_positions': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+                        'obstacles': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
                     })
                 else:
                     self.observation_space = gym.spaces.Dict({
-                        'distance_to_goal': gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
-                        'agents_positions': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
-                        'obstacles': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
+                        'distance_to_goal': gym.spaces.Box(low=-self.grid_size[0], high=self.grid_size[0], shape=(2,), dtype=int),
+                        'agents_positions': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
+                        'obstacles': gym.spaces.Box(low=0, high=1, shape=(self.observation_size, self.observation_size), dtype=int),
                     })
         else:
             raise ValueError("Invalid observation type: {}".format(self.observation_type))
@@ -205,12 +208,6 @@ class RLMAPF(MultiAgentEnv):
         if len(self.goal_positions) == 0:
             for agent in self._agent_ids:
                 self.goal_positions[agent] = self._random_pos()
-
-        # Precompute static obstacle grid for faster cropping
-        obstacles_array = np.zeros(self.grid_size, dtype=np.float32)
-        for pos in self.obstacles:
-            obstacles_array[pos] = 1.0
-        self._obstacles_grid = obstacles_array
 
         # Init D* Lite only if enabled
         if self.use_d_star_lite:
@@ -277,7 +274,10 @@ class RLMAPF(MultiAgentEnv):
 
     def step(self, input):
         # Move robots based on actions and handle collisions
-        actions = input
+        if self.predict_distance:
+            actions = {agent: input[agent][0] for agent in self._agent_ids}
+        else:
+            actions = input
         # Store last actions as a copy
         self.last_actions = {agent: action for agent, action in actions.items()}
         self.rewards = {agent: 0 for agent in self._agent_ids}
@@ -366,13 +366,8 @@ class RLMAPF(MultiAgentEnv):
         # Update agent positions
         self.agent_positions = new_state
 
-        # Increment per-agent step counters
-        for agent in self._agent_ids:
-            if not self.dones[agent]:
-                self.number_of_steps[agent] += 1
-
-        # Penalize left-side/bottom passing (if enabled)
-        if self.config.get("penalize_left_side_bottom_passing", False):
+        # Reward for right-side/top passing (if enabled)
+        if self.config.get("reward_right_side_passing", False):
             # For each pair of agents, check if they are passing each other
             for agent1 in self._agent_ids:
                 for agent2 in self._agent_ids:
@@ -390,25 +385,25 @@ class RLMAPF(MultiAgentEnv):
                     if (action1 == 0 and action2 == 1) or (action1 == 1 and action2 == 0):
                         # Check if they are on the same column and adjacent rows
                         if pos1_prev[0] == pos2_prev[0] and abs(pos1_prev[1] - pos2_prev[1]) == 1:
-                            # Penalize when the agent going up is to the left (lower x)
-                            if action1 == 0 and pos1_prev[0] < pos2_prev[0]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
-                            elif action2 == 0 and pos2_prev[0] < pos1_prev[0]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
+                            # The agent going up should be to the right (higher x)
+                            if action1 == 0 and pos1_prev[0] > pos2_prev[0]:
+                                self.rewards[agent1] += 0.1
+                                self.rewards[agent2] += 0.1
+                            elif action2 == 0 and pos2_prev[0] > pos1_prev[0]:
+                                self.rewards[agent1] += 0.1
+                                self.rewards[agent2] += 0.1
 
                     # Left/Right passing
                     if (action1 == 2 and action2 == 3) or (action1 == 3 and action2 == 2):
                         # Check if they are on the same row and adjacent columns
                         if pos1_prev[1] == pos2_prev[1] and abs(pos1_prev[0] - pos2_prev[0]) == 1:
-                            # Penalize when the agent going left is below (higher y)
-                            if action1 == 2 and pos1_prev[1] > pos2_prev[1]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
-                            elif action2 == 2 and pos2_prev[1] > pos1_prev[1]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
+                            # The agent going left should be on top (lower y)
+                            if action1 == 2 and pos1_prev[1] < pos2_prev[1]:
+                                self.rewards[agent1] += 0.1
+                                self.rewards[agent2] += 0.1
+                            elif action2 == 2 and pos2_prev[1] < pos1_prev[1]:
+                                self.rewards[agent1] += 0.1
+                                self.rewards[agent2] += 0.1
         # Update D* Lite paths only if enabled
         if self.use_d_star_lite:
             for agent in self._agent_ids:
@@ -526,29 +521,34 @@ class RLMAPF(MultiAgentEnv):
         return observations
     
     def _get_array_observations(self):
-        # Distance in x and y to goal (normalized and saturated at 32)
-        distance_to_goal = {agent: np.zeros(2, dtype=np.float32) for agent in self._agent_ids}
+        # Distance in x and y to goal
+        distance_to_goal = {agent: np.zeros(2, dtype=int) for agent in self._agent_ids}
         for agent, pos in self.agent_positions.items():
-            raw = np.array(self.goal_positions[agent]) - np.array(pos)
-            clipped = np.clip(raw, -32, 32)
-            distance_to_goal[agent] = clipped.astype(np.float32) / 32.0
+            distance_to_goal[agent] = np.array(self.goal_positions[agent]) - np.array(pos)
 
         # Position of other agents arrays
-        agents_positions_arrays = {agent: np.zeros(self.grid_size, dtype=np.float32) for agent in self._agent_ids}
+        agents_positions_arrays = {agent: np.zeros(self.grid_size, dtype=int) for agent in self._agent_ids}
         for agent, array in agents_positions_arrays.items():
             for agent2, pos in self.agent_positions.items():
                 if agent2 != agent:
-                    agents_positions_arrays[agent][pos] = 1.0
+                    agents_positions_arrays[agent][pos] = 1
         # Crop agent_positionsArrays to observation_size around agent
         for agent, array in agents_positions_arrays.items():
             x, y = self.agent_positions[agent]
             agents_positions_arrays[agent] = self.crop_array(array, x, y, self.observation_size, pad_value=0)
     
-        # Crop precomputed obstacles grid for each agent
-        obstacles_array = {}
-        for agent in self._agent_ids:
+        obstacles_array = {agent: np.zeros(self.grid_size, dtype=int) for agent in self._agent_ids}
+        for agent, array in obstacles_array.items():
+            if agent not in self._agent_ids:
+                continue
+            for pos in self.obstacles:
+                obstacles_array[agent][pos] = 1
+        # Crop obstacles_array to observation_size around agent
+        for agent, array in obstacles_array.items():
+            if agent not in self._agent_ids:
+                continue
             x, y = self.agent_positions[agent]
-            obstacles_array[agent] = self.crop_array(self._obstacles_grid, x, y, self.observation_size, pad_value=0).astype(np.float32)
+            obstacles_array[agent] = self.crop_array(array, x, y, self.observation_size, pad_value=0)
 
         # Include D* Lite paths only if enabled
         if self.use_d_star_lite:
@@ -565,11 +565,16 @@ class RLMAPF(MultiAgentEnv):
                 x, y = self.agent_positions[agent]
                 array = self.crop_array(array, x, y, self.observation_size, pad_value=0)
 
-                # Limit and normalize values vectorially
+                # turn everything in array bigger than 11 to 11
                 array[array > 10] = 10
-                mask = array != 0
-                array = array.astype(np.float32)
-                array[mask] = 1.0 - (array[mask] - 1.0) / 10.0
+
+                # # Turn everything into 0 or 1
+                # array[array != 0] = 1
+                # Turn everything into 0-1 based on how far the point is in the path, so turns 0 to 1, 1 to 0.9, 2 to 0.8, etc.
+                for i in range(array.shape[0]):
+                    for j in range(array.shape[1]):
+                        if array[i, j] != 0:
+                            array[i, j] = 1.0 - (array[i, j] - 1.0) / 10.0
                 
                 d_star_path_arrays[agent] = array
 
@@ -591,11 +596,16 @@ class RLMAPF(MultiAgentEnv):
                 x, y = self.agent_positions[agent]
                 array = self.crop_array(array, x, y, self.observation_size, pad_value=0)
                 
-                # Limit and normalize values vectorially
+                # turn everything in array bigger than 11 to 11
                 array[array > 10] = 10
-                array = array.astype(np.float32)
-                mask = array != 0
-                array[mask] = 1.0 - (array[mask] - 1.0) / 10.0
+                
+                # # Turn everything into 0 or 1
+                # array[array != 0] = 1
+                # Turn everything other than 0 into 0-1 based on how far the point is in the path, so turns 0 to 1, 1 to 0.9, 2 to 0.8, etc.
+                for i in range(array.shape[0]):
+                    for j in range(array.shape[1]):
+                        if array[i, j] != 0:
+                            array[i, j] = 1.0 - (array[i, j] - 1.0) / 10.0
                 
                 
                 others_d_star_path_arrays[agent] = array
@@ -611,7 +621,7 @@ class RLMAPF(MultiAgentEnv):
                         obstacles_array[agent].astype(np.float32),
                         agents_positions_arrays[agent].astype(np.float32),
                         d_star_path_arrays[agent].astype(np.float32),
-                        # others_d_star_path_arrays[agent].astype(np.float32),
+                        others_d_star_path_arrays[agent].astype(np.float32),
                     ], axis=-1)
                 else:
                     grid = np.stack([
@@ -758,8 +768,7 @@ class RLMAPF(MultiAgentEnv):
         # Save video if enabled
         if save_video:
             if not hasattr(self, "_video_writer"):
-                fps = int(self.render_config.get("video_fps", 10))
-                self._video_writer = FFMpegWriter(fps=fps, metadata=dict(artist='RLMAPF2 Sim'), bitrate=1800)
+                self._video_writer = FFMpegWriter(fps=int(1 / render_delay), metadata=dict(artist='RLMAPF2 Sim'), bitrate=1800)
                 self._video_writer.setup(self._fig, video_path, dpi=self.render_config["video_dpi"])
             self._video_writer.grab_frame()
 

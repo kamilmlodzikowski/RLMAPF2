@@ -1,0 +1,8 @@
+ray[rllib]==2.40.0
+torch==2.5.1
+gymnasium==1.0.0
+numpy==2.2.1
+PyYAML==6.0.2
+matplotlib==3.10.0
+tqdm==4.67.1
+wandb==0.19.2

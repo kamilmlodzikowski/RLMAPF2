@@ -1,4 +1,11 @@
---agents_num 40 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
---agents_num 40 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
---agents_num 40 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
---agents_num 40 --max_steps 250 --reward_closer_to_goal_final False --reward_final_d_star True --use_d_star_lite True
+# Baseline run with 40 agents and D* Lite enabled
+baseline --set environment.agents_num=40 --set environment.max_steps=250 --set environment.reward_closer_to_goal_final=False --set environment.reward_final_d_star=True --set environment.use_d_star_lite=True
+
+# Same as above but with CNN observation enabled
+baseline --set environment.agents_num=40 --set environment.max_steps=250 --set environment.reward_closer_to_goal_final=False --set environment.reward_final_d_star=True --set environment.use_d_star_lite=True --set environment.use_cnn_observation=True
+
+# Curriculum-friendly variant toggling evaluation cadence
+baseline --set environment.agents_num=20 --set training.eval_interval=25 --set training.evaluation_duration=5
+
+# Lightweight debugging configuration
+baseline --set environment.agents_num=4 --set training.episodes=50 --set training.save_interval=25

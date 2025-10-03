@@ -10,3 +10,5 @@ frames/*
 *.gif
 wandb
 __pycache__
+saved_models/
+experiments/

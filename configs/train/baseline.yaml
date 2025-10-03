@@ -1,0 +1,65 @@
+run:
+  name_prefix: baseline
+  project: rlmapf_big_empty
+  group: baseline
+  use_wandb: true
+  tags: []
+  notes: "Baseline PPO run with D* disabled"
+hardware:
+  num_cpus: 4
+  num_gpus: 1
+model:
+  framework: torch
+  api_stack:
+    enable_rl_module_and_learner: false
+    enable_env_runner_and_connector_v2: false
+  model:
+    fcnet_hiddens: [1024, 512, 512]
+    fcnet_activation: relu
+training:
+  episodes: 500
+  save_interval: 500
+  eval_interval: 50
+  evaluation_duration: 10
+  evaluation_enabled: true
+paths:
+  save_dir: saved_models
+  experiments_root: experiments
+  map_root: maps
+environment:
+  agents_num: 20
+  max_steps: 250
+  reward_closer_to_goal_final: true
+  reward_final_d_star: false
+  use_d_star_lite: false
+  use_cnn_observation: false
+  collision_penalty: 0.1
+  step_cost: 0.02
+  wait_cost_multiplier: 2
+  goal_reward: 10
+  observation_type: array
+  penalize_collision: true
+  penalize_waiting: true
+  penalize_steps: true
+  reward_closer_to_goal_each_step: false
+  reward_low_density: false
+  penalize_left_side_bottom_passing: true
+  render_mode: none
+  render_delay: 0.01
+  maps_names_with_variants:
+    big_empty_1-100a-20x20: null
+evaluation_environment:
+  max_steps: 200
+  step_cost: 0.01
+  wait_cost_multiplier: 2
+  reward_closer_to_goal_final: true
+  reward_final_d_star: false
+  penalize_left_side_bottom_passing: false
+logging:
+  params_to_log:
+    - env_runners/episode_reward_mean
+    - env_runners/episode_reward_min
+    - env_runners/episode_reward_max
+    - env_runners/episode_len_mean
+  local_metrics_file: metrics.jsonl
+  log_git_info: true

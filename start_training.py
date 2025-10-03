@@ -7,20 +7,25 @@ and manages parallel execution.
 """
 
 import argparse
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import ray
 from ray import tune
 
 
-TRAIN_SCRIPT = Path(__file__).parent / "train.py"
+TRAIN_SCRIPT = Path(__file__).resolve().parent / "train.py"
 
 
 def train_with_args(config: dict) -> None:
     """Run ``train.py`` with arguments provided by Ray Tune."""
-    args = config["args"].split()
-    cmd = ["python", str(TRAIN_SCRIPT)] + args
+    raw_args = config["args"]
+    tokens = shlex.split(raw_args)
+    if tokens and not any(token in {"--config", "-c"} for token in tokens):
+        tokens = ["--config", *tokens]
+    cmd = [sys.executable, str(TRAIN_SCRIPT)] + tokens
     subprocess.run(cmd, check=True)
 
 
@@ -45,7 +50,7 @@ def main() -> None:
     parser.add_argument(
         "--use_cnn_observation",
         action="store_true",
-        help="Append '--use_cnn_observation True' to each train.py invocation unless already present.",
+        help="Ensure each run sets environment.use_cnn_observation=True via config override.",
     )
     args = parser.parse_args()
 
@@ -55,10 +60,22 @@ def main() -> None:
     if args.use_cnn_observation:
         enforced_lines = []
         for line in lines:
-            if "--use_cnn_observation" in line:
-                enforced_lines.append(line)
-            else:
-                enforced_lines.append(line + " --use_cnn_observation True")
+            tokens = shlex.split(line)
+            has_override = False
+            for idx, token in enumerate(tokens):
+                if token in {"--set", "-s"} and idx + 1 < len(tokens):
+                    if tokens[idx + 1].startswith("environment.use_cnn_observation"):
+                        has_override = True
+                        break
+                if token.startswith("environment.use_cnn_observation"):
+                    has_override = True
+                    break
+                if token in {"--use_cnn_observation", "--use-cnn-observation"}:
+                    has_override = True
+                    break
+            if not has_override:
+                tokens.extend(["--set", "environment.use_cnn_observation=True"])
+            enforced_lines.append(shlex.join(tokens))
         lines = enforced_lines
 
     ray.init()

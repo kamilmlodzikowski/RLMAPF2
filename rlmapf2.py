@@ -38,6 +38,7 @@ class RLMAPF(MultiAgentEnv):
             raise ValueError("Observation size must be odd")
         self.observation_size = self.config["observation_size"]
         self.use_d_star_lite = self.config["use_d_star_lite"]
+        self.start_goal_on_periphery = self.config["start_goal_on_periphery"]
 
         # Set seed
         if self.config["seed"] is not None:
@@ -109,6 +110,7 @@ class RLMAPF(MultiAgentEnv):
             "reward_final_d_star": True,
             "use_d_star_lite": True,  # Enable or disable D* Lite
             "penalize_left_side_bottom_passing": False,  # Penalize left-side/bottom passing
+            "start_goal_on_periphery": False,  # Force spawn on border with mirrored goals
         }
         return default_config
 
@@ -161,6 +163,47 @@ class RLMAPF(MultiAgentEnv):
 
         pos_id = np.random.choice(range(len(free_positions)))
         return list(free_positions)[pos_id]
+
+    def _is_periphery(self, pos):
+        x, y = pos
+        max_x = self.grid_size[0] - 1
+        max_y = self.grid_size[1] - 1
+        return x == 0 or y == 0 or x == max_x or y == max_y
+
+    def _assign_periphery_positions(self):
+        max_x = self.grid_size[0] - 1
+        max_y = self.grid_size[1] - 1
+        candidates = []
+        for x in range(self.grid_size[0]):
+            for y in range(self.grid_size[1]):
+                pos = (x, y)
+                if not self._is_periphery(pos):
+                    continue
+                if pos in self.obstacles:
+                    continue
+                goal = (max_x - x, max_y - y)
+                if goal in self.obstacles:
+                    continue
+                candidates.append(pos)
+
+        required_agents = len(self._agent_ids)
+        if len(candidates) < required_agents:
+            raise ValueError(
+                "Not enough obstacle-free periphery cells ({}) to place {} agents with mirrored goals.".format(
+                    len(candidates), required_agents
+                )
+            )
+
+        candidates = np.array(candidates, dtype=int)
+        np.random.shuffle(candidates)
+
+        self.agent_positions = {}
+        self.goal_positions = {}
+        for agent, start in zip(sorted(self._agent_ids), candidates):
+            start = tuple(int(coord) for coord in start)
+            goal = (max_x - start[0], max_y - start[1])
+            self.agent_positions[agent] = start
+            self.goal_positions[agent] = goal
                 
     def reset(self, seed=None, options=None):
         """
@@ -196,15 +239,18 @@ class RLMAPF(MultiAgentEnv):
         else:
             raise ValueError("No maps to load")
         
-        # Generate random agent positions if empty
-        if len(self.agent_positions) == 0:
-            for agent in self._agent_ids:
-                self.agent_positions[agent] = self._random_pos()
+        if self.start_goal_on_periphery:
+            self._assign_periphery_positions()
+        else:
+            # Generate random agent positions if empty
+            if len(self.agent_positions) == 0:
+                for agent in self._agent_ids:
+                    self.agent_positions[agent] = self._random_pos()
 
-        # Generate random goal positions if empty
-        if len(self.goal_positions) == 0:
-            for agent in self._agent_ids:
-                self.goal_positions[agent] = self._random_pos()
+            # Generate random goal positions if empty
+            if len(self.goal_positions) == 0:
+                for agent in self._agent_ids:
+                    self.goal_positions[agent] = self._random_pos()
 
         # Precompute static obstacle grid for faster cropping
         obstacles_array = np.zeros(self.grid_size, dtype=np.float32)

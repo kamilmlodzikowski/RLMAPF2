@@ -656,16 +656,16 @@ class RLMAPF(MultiAgentEnv):
 
     def render(self, clear=True,
            title="RLMAPF Environment", 
-           save_frames=False, 
+           save_frames=True, 
            frames_path="frames/", 
-           save_video=False, 
+           save_video=True, 
            video_path="render.mp4", 
-           show_render=False,
+           show_render=False, 
            render_delay=0.2, 
            include_legend=True, 
            legend_position=(0, 0),
-           smooth_motion=True,
-           motion_frames=10):
+           smooth_motion=False,
+           motion_frames=5):
 
         if not hasattr(self, "_fig"):
             self._fig, self._ax = plt.subplots(figsize=(8, 8))
@@ -676,160 +676,139 @@ class RLMAPF(MultiAgentEnv):
             self._ax.set_yticks(range(self.grid_size[1] + 1))
             self._ax.grid(True)
             self._ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-            
-            # Persistent patches that don't change every frame
-            self._static_patches = []
-            self._goal_patches = {}
-            self._goal_texts = {}
-            
-            # Dynamic patches that animate
-            self._agent_circles = {}
-            self._agent_texts = {}
-            
+            self._patches = []
+            self._texts = []
             self._prev_agent_positions = {}
-            self._obstacles_drawn = False
 
-        # Set title
-        self._ax.set_title(title, fontsize=14)
-
-        # Draw static obstacles once
-        if not self._obstacles_drawn:
-            for obst in self.obstacles:
-                rect = Rectangle((obst[0], obst[1]), 1, 1, color="gray")
-                self._ax.add_patch(rect)
-                self._static_patches.append(rect)
-            self._obstacles_drawn = True
-
-        # Initialize previous positions
+        # Store previous positions for interpolation (first time)
         if not self._prev_agent_positions:
             self._prev_agent_positions = self.agent_positions.copy()
 
-        # Update or create goal patches (these change color when reached)
-        for agent, pos in self.goal_positions.items():
-            agent_nr = agent[len("agent_"):]
-            color = "green" if self.dones[agent] else "blue"
-            
-            if agent in self._goal_patches:
-                # Update existing goal color if needed
-                self._goal_patches[agent].set_color(color)
-            else:
-                # Create new goal
-                rect = Rectangle((pos[0], pos[1]), 1, 1, color=color)
-                self._ax.add_patch(rect)
-                self._goal_patches[agent] = rect
-                
-                text_size = 6 if len(agent_nr) > 1 else 8
-                text = self._ax.text(pos[0] + 0.5, pos[1] + 0.45, agent_nr, 
-                                color="white", ha="center", va="center", 
-                                zorder=1, fontsize=text_size)
-                self._goal_texts[agent] = text
+        # Determine how many frames to render
+        frames_to_render = motion_frames if smooth_motion else 1
 
-        # Animation function for agents
-        def update_agent_positions(t):
-            for agent, new_pos in self.agent_positions.items():
-                if self.dones[agent]:
-                    # Remove done agents
-                    if agent in self._agent_circles:
-                        self._agent_circles[agent].remove()
-                        self._agent_texts[agent].remove()
-                        del self._agent_circles[agent]
-                        del self._agent_texts[agent]
-                    continue
-                
-                agent_nr = agent[len("agent_"):]
-                old_pos = self._prev_agent_positions.get(agent, new_pos)
-                
-                # Interpolate position
-                interp_x = old_pos[0] * (1 - t) + new_pos[0] * t
-                interp_y = old_pos[1] * (1 - t) + new_pos[1] * t
-                
-                # Update existing or create new agent patches
-                if agent in self._agent_circles:
-                    self._agent_circles[agent].center = (interp_x + 0.5, interp_y + 0.5)
-                    self._agent_texts[agent].set_position((interp_x + 0.5, interp_y + 0.45))
-                else:
-                    circle = Circle((interp_x + 0.5, interp_y + 0.5), 0.4, 
-                                facecolor="yellow", edgecolor="black", zorder=2)
-                    self._ax.add_patch(circle)
-                    self._agent_circles[agent] = circle
-                    
-                    text_size = 6 if len(agent_nr) > 1 else 8
-                    text = self._ax.text(interp_x + 0.5, interp_y + 0.45, agent_nr, 
-                                    color="black", ha="center", va="center", 
-                                    fontsize=text_size, zorder=3)
-                    self._agent_texts[agent] = text
-
-        # Perform animation
-        if smooth_motion and motion_frames > 1:
-            for frame_idx in range(motion_frames):
+        # Render multiple frames for smooth motion
+        for frame_idx in range(frames_to_render):
+            # Calculate interpolation factor (0.0 to 1.0)
+            if smooth_motion and motion_frames > 1:
                 t = frame_idx / (motion_frames - 1)
-                update_agent_positions(t)
-                
-                # Only redraw canvas, not recreate everything
-                if show_render:
-                    self._fig.canvas.draw_idle()
-                    self._fig.canvas.flush_events()
-                    plt.pause(render_delay / motion_frames)
-                
-                if save_video:
-                    if not hasattr(self, "_video_writer"):
-                        fps = int(self.render_config.get("video_fps", 10)) * motion_frames
-                        self._video_writer = FFMpegWriter(fps=fps, metadata=dict(artist='RLMAPF2 Sim'), bitrate=1800)
-                        self._video_writer.setup(self._fig, video_path, dpi=self.render_config["video_dpi"])
-                    self._video_writer.grab_frame()
-        else:
-            # No smooth motion - just final position
-            update_agent_positions(1.0)
+            else:
+                t = 1.0
 
-        # Update previous positions
+            # Set the title
+            self._ax.set_title(title, fontsize=14)
+
+            # Clear previous patches and texts
+            for patch in self._patches:
+                patch.remove()
+            for text in self._texts:
+                text.remove()
+            self._patches.clear()
+            self._texts.clear()
+
+            # Draw obstacles
+            for obst in self.obstacles:
+                rect = Rectangle((obst[0], obst[1]), 1, 1, color="gray")
+                self._ax.add_patch(rect)
+                self._patches.append(rect)
+
+            # Draw goals
+            for agent, pos in self.goal_positions.items():
+                agent_nr = agent[len("agent_"):]
+                if not self.dones[agent]:
+                    rect = Rectangle((pos[0], pos[1]), 1, 1, color="blue")
+                else:
+                    rect = Rectangle((pos[0], pos[1]), 1, 1, color="green")
+                self._ax.add_patch(rect)
+                self._patches.append(rect)
+                text_size = 6 if len(agent_nr) > 1 else 8
+                text = self._ax.text(pos[0] + 0.5, pos[1] + 0.45, agent_nr, color="white", 
+                                ha="center", va="center", zorder=1, fontsize=text_size)
+                self._texts.append(text)
+            
+            # Draw agents with interpolation
+            for agent, new_pos in self.agent_positions.items():
+                agent_nr = agent[len("agent_"):]
+                if not self.dones[agent]:
+                    old_pos = self._prev_agent_positions.get(agent, new_pos)
+                    
+                    # Interpolate between old and new position
+                    interp_x = old_pos[0] + (new_pos[0] - old_pos[0]) * t
+                    interp_y = old_pos[1] + (new_pos[1] - old_pos[1]) * t
+                    
+                    rect = Circle((interp_x + 0.5, interp_y + 0.5), 0.4, facecolor="yellow", edgecolor="black")
+                    self._ax.add_patch(rect)
+                    self._patches.append(rect)
+                    text_size = 6 if len(agent_nr) > 1 else 8
+                    text = self._ax.text(interp_x + 0.5, interp_y + 0.45, agent_nr, color="black", 
+                                    ha="center", va="center", fontsize=text_size)
+                    self._texts.append(text)
+
+            # Add legend
+            if not hasattr(self, "_legend_text_obj") and include_legend:
+                legend_text = (
+                    "Legend:\n"
+                    "Yellow: Robot\n"
+                    "Blue: Goal\n"
+                    "Green: Reached Goal\n"
+                    "Gray: Obstacle\n"
+                )
+                self._legend_text_obj = self._ax.text(legend_position[0], self.grid_size[1] + legend_position[1], 
+                                                    legend_text, fontsize=10, va="top", ha="left", 
+                                                    bbox=dict(facecolor='white', alpha=0.5, edgecolor='black'))
+
+            # Add step number
+            step_text = f"Step: {self.steps}"
+            text_offset = len(step_text) * 0.3
+            if hasattr(self, "_step_text_obj"):
+                self._step_text_obj.set_text(step_text)
+                self._step_text_obj.set_position((self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3))
+            else:
+                self._step_text_obj = self._ax.text(self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3, 
+                                                step_text, fontsize=10, va="top")
+
+            # Update the plot
+            if show_render:
+                plt.draw()
+                plt.pause(render_delay / frames_to_render)
+
+            # Save frames if enabled
+            if save_frames:
+                if not os.path.exists(frames_path):
+                    os.makedirs(frames_path)
+                if smooth_motion:
+                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}_frame_{frame_idx:02d}.png")
+                else:
+                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}.png")
+                plt.savefig(frame_path, format="png", bbox_inches="tight", dpi=150)
+
+            # Save video if enabled
+            if save_video:
+                if not hasattr(self, "_video_writer"):
+                    fps = int(self.render_config.get("video_fps", 10))
+                    if smooth_motion:
+                        fps = fps * motion_frames
+                    self._video_writer = FFMpegWriter(fps=fps, metadata=dict(artist='RLMAPF2 Sim'), bitrate=1800)
+                    self._video_writer.setup(self._fig, video_path, dpi=self.render_config["video_dpi"])
+                self._video_writer.grab_frame()
+
+            # Clear the output if needed (only after last frame)
+            if clear and frame_idx == frames_to_render - 1:
+                self._ax.cla()
+
+        # Update previous positions after rendering all frames
         self._prev_agent_positions = self.agent_positions.copy()
 
-        # Add legend once
-        if not hasattr(self, "_legend_text_obj") and include_legend:
-            legend_text = (
-                "Legend:\n"
-                "Yellow: Robot\n"
-                "Blue: Goal\n"
-                "Green: Reached Goal\n"
-                "Gray: Obstacle\n"
-            )
-            self._legend_text_obj = self._ax.text(
-                legend_position[0], self.grid_size[1] + legend_position[1], 
-                legend_text, fontsize=10, va="top", ha="left", 
-                bbox=dict(facecolor='white', alpha=0.5, edgecolor='black'))
 
-        # Update step number
-        step_text = f"Step: {self.steps}"
-        text_offset = len(step_text) * 0.3
-        if hasattr(self, "_step_text_obj"):
-            self._step_text_obj.set_text(step_text)
-            self._step_text_obj.set_position((self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3))
-        else:
-            self._step_text_obj = self._ax.text(
-                self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3, 
-                step_text, fontsize=10, va="top")
+    def finalize_video(self):
+        """
+        Finalizes and closes the video file.
+        Call this at the end of your episode.
+        """
+        if hasattr(self, "_video_writer"):
+            self._video_writer.finish()
+            del self._video_writer
 
-        # Final display update
-        if show_render:
-            plt.draw()
-            plt.pause(render_delay)
-
-        # Save final frame
-        if save_frames:
-            if not os.path.exists(frames_path):
-                os.makedirs(frames_path)
-            frame_path = os.path.join(frames_path, f"frame_{self.steps:04d}.svg")
-            plt.savefig(frame_path, format="svg", bbox_inches="tight", dpi=300)
-
-        # Save to video
-        if save_video:
-            if not hasattr(self, "_video_writer"):
-                fps = int(self.render_config.get("video_fps", 10))
-                if smooth_motion:
-                    fps *= motion_frames
-                self._video_writer = FFMpegWriter(fps=fps, metadata=dict(artist='RLMAPF2 Sim'), bitrate=1800)
-                self._video_writer.setup(self._fig, video_path, dpi=self.render_config["video_dpi"])
-            self._video_writer.grab_frame()
 
 
     def load_map(self):

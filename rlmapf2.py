@@ -777,10 +777,14 @@ class RLMAPF(MultiAgentEnv):
                 if not os.path.exists(frames_path):
                     os.makedirs(frames_path)
                 if smooth_motion:
-                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}_frame_{frame_idx:02d}.png")
+                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}_frame_{frame_idx:02d}")
                 else:
-                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}.png")
-                plt.savefig(frame_path, format="png", bbox_inches="tight", dpi=150)
+                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}")
+                # Get format and dpi from config, with defaults
+                frame_format = self.render_config.get("frame_format", "png")
+                frame_dpi = self.render_config.get("frame_dpi", 150)
+                frame_path_with_ext = f"{frame_path}.{frame_format}"
+                plt.savefig(frame_path_with_ext, format=frame_format, bbox_inches="tight", dpi=frame_dpi)
 
             # Save video if enabled
             if save_video:

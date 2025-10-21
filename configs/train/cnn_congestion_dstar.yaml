@@ -1,10 +1,10 @@
 run:
-  name_prefix: cnn-periphery
-  project: rlmapf_periphery
-  group: cnn_periphery
+  name_prefix: cnn-congestion-dstar
+  project: rlmapf_congestion
+  group: cnn_congestion_spread
   use_wandb: true
-  tags: [cnn, periphery]
-  notes: "CNN observation with mirrored border start/goal placements"
+  tags: [cnn, d_star, congestion]
+  notes: "CNN observation with congestion-aware D* Lite (4 iterations, weight 0.5)."
 hardware:
   num_cpus: 4
   num_gpus: 1
@@ -35,7 +35,9 @@ environment:
   max_steps: 250
   reward_closer_to_goal_final: true
   reward_final_d_star: false
-  use_d_star_lite: false
+  use_d_star_lite: true
+  d_star_iterations: 4
+  d_star_congestion_weight: 0.5
   use_cnn_observation: true
   collision_penalty: 0.1
   step_cost: 0.02
@@ -59,6 +61,9 @@ evaluation_environment:
   wait_cost_multiplier: 2
   reward_closer_to_goal_final: true
   reward_final_d_star: false
+  use_d_star_lite: true
+  d_star_iterations: 4
+  d_star_congestion_weight: 0.5
   penalize_left_side_bottom_passing: false
 logging:
   params_to_log:

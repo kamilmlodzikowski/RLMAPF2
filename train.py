@@ -9,6 +9,8 @@ import math
 import subprocess
 import sys
 import time
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from random import randint
 from typing import Any, Dict, Iterable, List, Optional
@@ -16,6 +18,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
+
+import matplotlib.pyplot as plt
 
 from rlmapf2 import RLMAPF
 from rlmapf_config import (
@@ -282,6 +286,117 @@ def record_checkpoint(path: Path, episode: Optional[int], index_file: Path) -> N
         handle.write(json.dumps(entry) + "\n")
 
 
+def _sanitize_for_path(value: Optional[str], fallback: str) -> str:
+    if not value:
+        return fallback
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value.strip())
+    safe = safe.strip("_")
+    return safe or fallback
+
+
+def record_policy_video(
+    algorithm: Any,
+    base_env_config: Dict[str, Any],
+    videos_root: Path,
+    run_name: str,
+    wandb_group: Optional[str],
+    max_render_steps: Optional[int] = None,
+) -> Optional[Path]:
+    """Render a policy rollout to a video file and return the output path."""
+    if algorithm is None:
+        return None
+
+    env_config = deepcopy(base_env_config)
+    render_config = dict(env_config.get("render_config", {}))
+    env_config["render_mode"] = "human"
+    render_config.setdefault("title", run_name)
+    render_config["save_video"] = True
+    render_config["show_render"] = False
+    render_config["save_frames"] = False
+
+    videos_root.mkdir(parents=True, exist_ok=True)
+    date_dir = videos_root / datetime.now().strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    group_component = _sanitize_for_path(wandb_group, "no-group")
+    folder_name = run_name if wandb_group is None else f"{run_name}_{group_component}"
+    run_dir = date_dir / folder_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    video_path = run_dir / f"{run_name}.mp4"
+    suffix = 1
+    while video_path.exists():
+        video_path = run_dir / f"{run_name}_{suffix}.mp4"
+        suffix += 1
+
+    render_config["video_path"] = str(video_path)
+    render_config.setdefault("video_fps", 10)
+    render_config.setdefault("video_dpi", 300)
+    render_config.setdefault("legend_position", (0, 0))
+    render_config.setdefault("frames_path", str(run_dir / "frames"))
+    render_config.setdefault("render_delay", 0.0)
+    render_config.setdefault("include_legend", True)
+    env_config["render_config"] = render_config
+
+    env = None
+    try:
+        env = RLMAPF(env_config)
+        seed = env_config.get("seed")
+        observations, _ = env.reset(seed=seed)
+        max_steps = max_render_steps or env_config.get("max_steps") or env.max_steps
+        step = 0
+        while step < max_steps:
+            # Compute actions per agent to match the trained policy's expected
+            # observation structure (avoid passing a multi-agent obs dict directly).
+            int_actions: Dict[str, int] = {}
+            for agent_id, obs in observations.items():
+                # Default to the single (default) policy used during training.
+                try:
+                    result = algorithm.compute_single_action(obs, explore=False, policy_id="default_policy")  # type: ignore[attr-defined]
+                except TypeError:
+                    # Some RLlib versions don't require/allow policy_id here.
+                    result = algorithm.compute_single_action(obs, explore=False)  # type: ignore[attr-defined]
+                except Exception:
+                    # Fallback to explicit policy API if available.
+                    try:
+                        policy = algorithm.get_policy("default_policy")  # type: ignore[attr-defined]
+                    except Exception:
+                        policy = algorithm.get_policy()  # type: ignore[attr-defined]
+                    result = policy.compute_single_action(obs, explore=False)  # type: ignore[attr-defined]
+
+                # Support both return shapes: action or (action, state_out, info)
+                action = result[0] if isinstance(result, tuple) else result
+
+                # RLlib may return numpy scalars/arrays; normalise to ints for the env.
+                if isinstance(action, tuple):
+                    action = action[0]
+                if isinstance(action, (list, np.ndarray)):
+                    action = np.asarray(action).item()
+                int_actions[agent_id] = int(action)
+            observations, _, terminateds, truncateds, _ = env.step(int_actions)
+            step += 1
+            if terminateds.get("__all__", False) or truncateds.get("__all__", False):
+                break
+
+        logger.info("Saved evaluation video for %s to %s", run_name, video_path)
+        if not video_path.exists():
+            raise RuntimeError(f"Video file was not created at {video_path}")
+        return video_path
+    except Exception:
+        logger.exception("Failed to record evaluation video for %s", run_name)
+        return None
+    finally:
+        if env is not None and hasattr(env, "_video_writer"):
+            try:
+                env._video_writer.finish()
+            except Exception:
+                logger.warning("Unable to finalise video writer for %s", run_name, exc_info=True)
+        if env is not None and hasattr(env, "_fig"):
+            try:
+                plt.close(env._fig)
+            except Exception:
+                logger.debug("Failed to close matplotlib figure for %s", run_name, exc_info=True)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args(argv)
@@ -305,6 +420,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     config_dir = experiment_dir / "config"
     metrics_file = experiment_dir / config.logging.local_metrics_file
     checkpoint_index_path = experiment_dir / "checkpoints.jsonl"
+    videos_root = (repo_root / "videos").resolve()
     experiment_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -384,6 +500,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     algorithm = None
     return_code = 0
+    video_output_path: Optional[Path] = None
 
     try:
         with metrics_file.open("a", encoding="utf-8") as metrics_handle:
@@ -451,6 +568,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "final_checkpoint": str(final_checkpoint),
                     "best_metrics": serialise_best(best_metrics),
                 }
+                video_env_config = eval_env_config if eval_env_config is not None else env_config
+                video_output_path = record_policy_video(
+                    algorithm,
+                    video_env_config,
+                    videos_root,
+                    run_name,
+                    config.run.group,
+                )
+                if video_output_path is not None:
+                    summary_payload["video_path"] = str(video_output_path)
                 summary_path.write_text(
                     json.dumps(summary_payload, indent=2, sort_keys=True),
                     encoding="utf-8",
@@ -461,6 +588,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     for key, entry in best_for_logging.items():
                         wandb_run.summary[f"best/{key}"] = entry["value"]
                         wandb_run.summary[f"best_episode/{key}"] = entry["episode"]
+                    if video_output_path is not None:
+                        wandb_run.summary["video/demo"] = str(video_output_path)
             except KeyboardInterrupt:
                 logger.warning("Interrupted by user. Saving latest checkpoint before exit.")
                 if algorithm is not None:
@@ -476,6 +605,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "status": "interrupted",
                         "best_metrics": serialise_best(best_metrics),
                     }
+                    video_env_config = eval_env_config if eval_env_config is not None else env_config
+                    video_output_path = record_policy_video(
+                        algorithm,
+                        video_env_config,
+                        videos_root,
+                        run_name,
+                        config.run.group,
+                    )
+                    if video_output_path is not None:
+                        summary_payload["video_path"] = str(video_output_path)
                     summary_path.write_text(
                         json.dumps(summary_payload, indent=2, sort_keys=True),
                         encoding="utf-8",

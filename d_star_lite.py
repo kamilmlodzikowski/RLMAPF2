@@ -1,7 +1,7 @@
 # FROM https://github.com/Sollimann/Dstar-lite-pathplanner
 
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 OBSTACLE = 255
 UNOCCUPIED = 0
@@ -52,6 +52,9 @@ class OccupancyGridMap:
         # the obstacle map
         self.occupancy_grid_map = np.zeros(self.map_extents, dtype=np.uint8)
 
+        # traversal cost multiplier per cell (1.0 = baseline cost)
+        self.traversal_costs = np.ones(self.map_extents, dtype=np.float32)
+
         # obstacles
         self.visited = {}
         self.exploration_setting = exploration_setting
@@ -67,7 +70,26 @@ class OccupancyGridMap:
         :param new_ogrid:
         :return: None
         """
+        if new_ogrid.shape != self.map_extents:
+            raise ValueError("New occupancy grid shape {} does not match map extents {}".format(new_ogrid.shape, self.map_extents))
         self.occupancy_grid_map = new_ogrid
+
+    def set_traversal_costs(self, new_costs: np.ndarray):
+        """
+        :param new_costs: array of same shape as map with traversal multipliers
+        """
+        if new_costs.shape != self.map_extents:
+            raise ValueError("Traversal cost shape {} does not match map extents {}".format(new_costs.shape, self.map_extents))
+        self.traversal_costs = new_costs.astype(np.float32)
+
+    def reset_traversal_costs(self):
+        """Reset traversal multipliers back to 1.0 everywhere."""
+        self.traversal_costs.fill(1.0)
+
+    def get_traversal_cost(self, pos: (int, int)) -> float:
+        """Return traversal multiplier for cell `pos`."""
+        (x, y) = (round(pos[0]), round(pos[1]))
+        return float(self.traversal_costs[x, y])
 
     def is_unoccupied(self, pos: (int, int)) -> bool:
         """
@@ -194,7 +216,8 @@ class DStarLite:
         if not self.sensed_map.is_unoccupied(u) or not self.sensed_map.is_unoccupied(v):
             return float('inf')
         else:
-            return heuristic(u, v)
+            traversal_multiplier = self.sensed_map.get_traversal_cost(v)
+            return heuristic(u, v) * traversal_multiplier
 
     def contain(self, u: (int, int)) -> (int, int):
         return u in self.U.vertices_in_heap
@@ -208,7 +231,7 @@ class DStarLite:
             self.U.remove(u)
 
     def compute_shortest_path(self):
-        while self.U.top_key() < self.calculate_key(self.s_start) or self.rhs[self.s_start] > self.g[self.s_start]:
+        while self.U.top_key() < self.calculate_key(self.s_start) or self.rhs[self.s_start] != self.g[self.s_start]:
             u = self.U.top()
             k_old = self.U.top_key()
             k_new = self.calculate_key(u)
@@ -238,7 +261,7 @@ class DStarLite:
                                 if min_s > temp:
                                     min_s = temp
                             self.rhs[s] = min_s
-                    self.update_vertex(u)
+                    self.update_vertex(s)
 
     def get_next_step(self) -> (int, int):
         min_s = float('inf')
@@ -335,6 +358,8 @@ class DStarLite:
                     arg_min = s_
 
             ### algorithm sometimes gets stuck here for some reason !!! FIX
+            if arg_min is None:
+                raise RuntimeError(f"No feasible successor from {self.s_start}; planner stuck.")
             self.s_start = arg_min
             path.append(self.s_start)
             # scan graph for changed costs
@@ -368,6 +393,76 @@ class DStarLite:
             self.compute_shortest_path()
         # print("path found!")
         return path, self.g, self.rhs
+
+
+def iterative_congestion_d_star(
+    x_dim: int,
+    y_dim: int,
+    obstacle_grid: np.ndarray,
+    agent_starts: Dict[str, Tuple[int, int]],
+    agent_goals: Dict[str, Tuple[int, int]],
+    iterations: int = 1,
+    congestion_weight: float = 1.0,
+) -> (Dict[str, List[Tuple[int, int]]], np.ndarray):
+    """
+    Run multiple rounds of D* Lite planning, cumulatively inflating traversal costs between rounds based on congestion.
+
+    Args:
+        x_dim: Grid width.
+        y_dim: Grid height.
+        obstacle_grid: Array matching grid size where OBSTACLE cells are blocked.
+        agent_starts: Mapping of agent id to start position.
+        agent_goals: Mapping of agent id to goal position.
+        iterations: Number of planning iterations to perform (>= 1).
+        congestion_weight: Multiplier applied to congestion counts when updating traversal costs. Penalties accumulate over iterations, but an agent’s own prior penalties are removed before replanning it.
+
+    Returns:
+        Tuple of:
+            - dict mapping agent id to path (as produced during the final iteration)
+            - np.ndarray of traversal cost multipliers to reuse for subsequent planning.
+    """
+    if iterations < 1:
+        raise ValueError("iterations must be at least 1")
+    if obstacle_grid.shape != (x_dim, y_dim):
+        raise ValueError("obstacle_grid shape {} does not match provided dimensions ({}, {})".format(obstacle_grid.shape, x_dim, y_dim))
+
+    base_map = OccupancyGridMap(x_dim, y_dim)
+    base_map.set_map(obstacle_grid)
+
+    traversal_costs = np.ones((x_dim, y_dim), dtype=np.float32)
+    last_iteration_paths: Dict[str, List[Tuple[int, int]]] = {agent: [] for agent in agent_starts}
+    agent_penalties: Dict[str, np.ndarray] = {
+        agent: np.zeros((x_dim, y_dim), dtype=np.float32) for agent in agent_starts
+    }
+
+    for iteration_idx in range(iterations):
+        base_map.set_traversal_costs(traversal_costs)
+        current_paths: Dict[str, List[Tuple[int, int]]] = {}
+
+        for agent_id, start in agent_starts.items():
+            if congestion_weight != 0.0:
+                prior_penalty = agent_penalties[agent_id]
+                if prior_penalty.any():
+                    traversal_costs -= prior_penalty
+                    prior_penalty.fill(0.0)
+                    base_map.set_traversal_costs(traversal_costs)
+
+            goal = agent_goals[agent_id]
+            planner = DStarLite(base_map, start, goal)
+            path, _, _ = planner.move_and_replan(start)
+            current_paths[agent_id] = path
+
+            if congestion_weight != 0.0:
+                penalty = agent_penalties[agent_id]
+                penalty.fill(0.0)
+                for cell in path:
+                    penalty[cell] += congestion_weight
+                traversal_costs += penalty
+                base_map.set_traversal_costs(traversal_costs)
+
+        last_iteration_paths = current_paths
+
+    return last_iteration_paths, traversal_costs
 
 class Priority:
     """

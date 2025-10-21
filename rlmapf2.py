@@ -9,7 +9,7 @@ from gymnasium import spaces
 from heapq import heappush, heappop
 import os
 import json
-from d_star_lite import DStarLite, OccupancyGridMap
+from d_star_lite import DStarLite, OccupancyGridMap, iterative_congestion_d_star
 
 import matplotlib.pyplot as plt
 
@@ -109,6 +109,8 @@ class RLMAPF(MultiAgentEnv):
             "reward_closer_to_goal_final": False,
             "reward_final_d_star": True,
             "use_d_star_lite": True,  # Enable or disable D* Lite
+            "d_star_iterations": 1,  # Number of congestion-based replanning rounds
+            "d_star_congestion_weight": 1.0,  # Cost multiplier per unit of congestion
             "penalize_left_side_bottom_passing": False,  # Penalize left-side/bottom passing
             "start_goal_on_periphery": False,  # Force spawn on border with mirrored goals
         }
@@ -260,17 +262,42 @@ class RLMAPF(MultiAgentEnv):
 
         # Init D* Lite only if enabled
         if self.use_d_star_lite:
-            self.d_star_maps = {agent: OccupancyGridMap(self.grid_size[0], self.grid_size[1]) for agent in self._agent_ids}
-            self.d_star_paths = {agent: [] for agent in self._agent_ids}
-            obstacles_array = np.zeros(self.grid_size, dtype=int)
+            d_star_obstacles = np.zeros(self.grid_size, dtype=np.uint8)
             for pos in self.obstacles:
-                obstacles_array[pos] = 255
+                d_star_obstacles[pos] = 255
+
+            iterations = max(1, int(self.config.get("d_star_iterations", 1)))
+            congestion_weight = float(self.config.get("d_star_congestion_weight", 1.0))
+
+            if iterations > 1:
+                _, traversal_costs = iterative_congestion_d_star(
+                    self.grid_size[0],
+                    self.grid_size[1],
+                    d_star_obstacles,
+                    {agent: self.agent_positions[agent] for agent in self._agent_ids},
+                    {agent: self.goal_positions[agent] for agent in self._agent_ids},
+                    iterations=iterations,
+                    congestion_weight=congestion_weight,
+                )
+            else:
+                traversal_costs = np.ones(self.grid_size, dtype=np.float32)
+
+            self.d_star_maps = {}
+            self.d_stars = {}
+            self.d_star_paths = {}
+
             for agent in self._agent_ids:
-                self.d_star_maps[agent].set_map(obstacles_array)
-            self.d_stars = {agent: DStarLite(self.d_star_maps[agent], self.agent_positions[agent], self.goal_positions[agent]) for agent in self._agent_ids}
-            for agent in self._agent_ids:
-                path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
+                occupancy_map = OccupancyGridMap(self.grid_size[0], self.grid_size[1])
+                occupancy_map.set_map(d_star_obstacles)
+                occupancy_map.set_traversal_costs(traversal_costs)
+                planner = DStarLite(occupancy_map, self.agent_positions[agent], self.goal_positions[agent])
+
+                self.d_star_maps[agent] = occupancy_map
+                self.d_stars[agent] = planner
+
+                path, _, _ = planner.move_and_replan(self.agent_positions[agent])
                 self.d_star_paths[agent] = path
+
             self.start_d_star_paths = deepcopy(self.d_star_paths)
 
         # Render

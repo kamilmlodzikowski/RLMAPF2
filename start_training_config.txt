@@ -1,9 +1,15 @@
 # CNN periphery mirrored spawn experiment (start_goal_on_periphery enabled)
-cnn_periphery --set training.random_seed=0 --set run.group=no-penalty --set environment.penalize_left_side_bottom_passing=False
-cnn_periphery --set training.random_seed=1 --set run.group=no-penalty --set environment.penalize_left_side_bottom_passing=False
-cnn_periphery --set training.random_seed=2 --set run.group=no-penalty --set environment.penalize_left_side_bottom_passing=False
-cnn_periphery --set training.random_seed=3 --set run.group=no-penalty --set environment.penalize_left_side_bottom_passing=False
-cnn_periphery --set training.random_seed=0 --set run.group=penalty --set environment.penalize_left_side_bottom_passing=True
-cnn_periphery --set training.random_seed=1 --set run.group=penalty --set environment.penalize_left_side_bottom_passing=True
-cnn_periphery --set training.random_seed=2 --set run.group=penalty --set environment.penalize_left_side_bottom_passing=True
-cnn_periphery --set training.random_seed=3 --set run.group=penalty --set environment.penalize_left_side_bottom_passing=True
+# cnn_periphery --set training.episodes=100 --set training.random_seed=0 --set run.group=grid-no-penalty --set environment.penalize_left_side_bottom_passing=False
+# cnn_periphery --set training.episodes=100 --set training.random_seed=1 --set run.group=grid-no-penalty --set environment.penalize_left_side_bottom_passing=False
+# cnn_periphery --set training.episodes=100 --set training.random_seed=2 --set run.group=grid-no-penalty --set environment.penalize_left_side_bottom_passing=False
+# cnn_periphery --set training.episodes=100 --set training.random_seed=3 --set run.group=grid-no-penalty --set environment.penalize_left_side_bottom_passing=False
+# cnn_periphery --set training.episodes=100 --set training.random_seed=0 --set run.group=grid-penalty --set environment.penalize_left_side_bottom_passing=True
+# cnn_periphery --set training.episodes=100 --set training.random_seed=1 --set run.group=grid-penalty --set environment.penalize_left_side_bottom_passing=True
+# cnn_periphery --set training.episodes=100 --set training.random_seed=2 --set run.group=grid-penalty --set environment.penalize_left_side_bottom_passing=True
+# cnn_periphery --set training.episodes=100 --set training.random_seed=3 --set run.group=grid-penalty --set environment.penalize_left_side_bottom_passing=True
+#
+# Congestion-aware D* Lite experiment (4 iterations, weight 0.5)
+cnn_congestion_dstar --set training.episodes=150 --set training.random_seed=0 --set run.group=no-congestion-dstar --set run.name_prefix=cnn-congestion-dstar --set environment.d_star_iterations=1 --set environment.d_star_congestion_weight=1
+cnn_congestion_dstar --set training.episodes=150 --set training.random_seed=1 --set run.group=no-congestion-dstar --set run.name_prefix=cnn-congestion-dstar --set environment.d_star_iterations=1 --set environment.d_star_congestion_weight=1
+cnn_congestion_dstar --set training.episodes=150 --set training.random_seed=2 --set run.group=no-congestion-dstar --set run.name_prefix=cnn-congestion-dstar --set environment.d_star_iterations=1 --set environment.d_star_congestion_weight=1
+cnn_congestion_dstar --set training.episodes=150 --set training.random_seed=3 --set run.group=no-congestion-dstar --set run.name_prefix=cnn-congestion-dstar --set environment.d_star_iterations=1 --set environment.d_star_congestion_weight=1

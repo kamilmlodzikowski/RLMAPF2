@@ -104,6 +104,13 @@ Flags control optional augmentations (`--flip_*`, `--rot*`, `--translate`,
 script reads the template, produces variants, previews the JSON, and writes
 `<name>_<agents>a-<width>x<height>.json` into `maps/`.
 
+Set `environment.start_goal_on_periphery=true` in a train config (or via
+`--set`) to override any map-provided spawn points. When enabled, agents are
+placed uniformly along the accessible border and their goals are mirrored to
+the diametrically opposite border cell (e.g. `(0, 0)` pairs with
+`(width-1, height-1)`). Ensure the chosen maps have obstacle-free perimeter
+cells; otherwise the run will error during reset.
+
 ## Experiment Documentation
 
 `docs/experiments.md` expands on the workflow, including tips for creating new

@@ -656,7 +656,7 @@ class RLMAPF(MultiAgentEnv):
 
     def render(self, clear=True,
            title="RLMAPF Environment", 
-           save_frames=True, 
+           save_frames=False, 
            frames_path="frames/", 
            save_video=True, 
            video_path="render.mp4", 

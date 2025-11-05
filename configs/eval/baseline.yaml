@@ -24,7 +24,7 @@ training:
   evaluation_enabled: false
 paths:
   save_dir: saved_models
-  experiments_root: experiments
+  experiments_root: experiments/eval/baseline
   map_root: maps
 environment:
   agents_num: 20

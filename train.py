@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import subprocess
 import sys
 import time
@@ -171,6 +172,59 @@ def collect_overrides(args: argparse.Namespace) -> List[str]:
     return overrides
 
 
+def detect_available_gpus() -> int:
+    """Detect the number of visible CUDA devices without requiring Ray to be initialised."""
+    try:
+        import torch
+
+        count = torch.cuda.device_count()
+        if isinstance(count, int) and count >= 0:
+            return count
+    except Exception:
+        # Fall back to environment inspection if torch is unavailable or misconfigured.
+        logger.debug("Unable to query GPU count via torch", exc_info=True)
+
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible:
+        devices = [
+            device.strip()
+            for device in cuda_visible.split(",")
+            if device.strip() and device.strip() not in {"-1"}
+        ]
+        return len(devices)
+    return 0
+
+
+def reconcile_gpu_config(config: TrainConfig) -> None:
+    """Adjust GPU-related configuration based on the actual hardware availability."""
+    available_gpus = detect_available_gpus()
+    requested_gpus = config.hardware.num_gpus
+
+    if available_gpus == 0:
+        if requested_gpus and requested_gpus > 0:
+            logger.warning(
+                "No GPUs detected on this machine. Overriding hardware.num_gpus from %s to 0.",
+                requested_gpus,
+            )
+            config.hardware.num_gpus = 0.0
+        for key, value in list(config.model.resources.items()):
+            if "gpu" in key.lower() and isinstance(value, (int, float)) and value > 0:
+                logger.warning(
+                    "No GPUs detected. Overriding model.resources.%s from %s to 0.",
+                    key,
+                    value,
+                )
+                config.model.resources[key] = 0
+    elif requested_gpus > available_gpus:
+        logger.warning(
+            "Requested %s GPU(s) but only %s detected. Using %s GPU(s) instead.",
+            requested_gpus,
+            available_gpus,
+            available_gpus,
+        )
+        config.hardware.num_gpus = float(available_gpus)
+
+
 def build_run_name(config: TrainConfig, explicit_name: Optional[str]) -> str:
     if explicit_name:
         return explicit_name
@@ -298,6 +352,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if config.run.use_wandb and wandb is None:
         logger.warning("wandb is not installed. Disabling Weights & Biases logging.")
         config.run.use_wandb = False
+
+    reconcile_gpu_config(config)
 
     run_name = build_run_name(config, args.run_name)
     experiment_dir = (config.paths.experiments_root / run_name).resolve()

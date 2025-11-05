@@ -184,6 +184,43 @@ def collect_git_info(repo_root: Path) -> Dict[str, Any]:
     return {"commit": commit, "branch": branch, "status": status}
 
 
+def is_valid_checkpoint_dir(path: Path) -> bool:
+    """Return True if the directory looks like an RLlib checkpoint."""
+    if not path.is_dir():
+        return False
+    for filename in ("algorithm_state.pkl", "algorithm_state.msgpck"):
+        if (path / filename).is_file():
+            return True
+    return any(child.is_dir() and child.name.startswith("checkpoint-") for child in path.iterdir())
+
+
+def resolve_checkpoint_path(path: Path) -> Path:
+    """
+    Resolve a user-provided checkpoint path to a valid RLlib checkpoint directory.
+
+    Handles the common cases where the user points to a parent 'checkpoints' folder
+    instead of the checkpoint directory itself.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint path does not exist: {path}")
+
+    if path.is_file() or is_valid_checkpoint_dir(path):
+        return path
+
+    candidates = [
+        child for child in path.iterdir()
+        if is_valid_checkpoint_dir(child)
+    ]
+    if candidates:
+        # Pick the most recently modified checkpoint directory.
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        resolved = candidates[0]
+        logger.info("Using checkpoint directory '%s' inside '%s'", resolved, path)
+        return resolved
+
+    raise ValueError(f"Given checkpoint path does not contain a valid checkpoint: {path}")
+
+
 def build_run_name(config: Dict[str, Any], explicit_name: Optional[str]) -> str:
     """Build run name for the evaluation."""
     if explicit_name:
@@ -288,6 +325,54 @@ def save_metadata(
     with open(config_file, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
+def plot_evaluation_summary(summary_path: Path, save_path: Optional[Path] = None) -> None:
+    """
+    Create a multi-subplot figure with all numeric metrics from summary.csv.
+    Each metric gets its own subplot automatically.
+    """
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    df = pd.read_csv(summary_path)
+    print(f"[Plot] Loaded {len(df)} rows from {summary_path}")
+    df = df.sort_values("agents_num")
+
+    # Select numeric columns except 'agents_num'
+    numeric_cols = [c for c in df.select_dtypes(include=['number']).columns if c != "agents_num"]
+    if not numeric_cols:
+        print("[Plot] No numeric metrics found.")
+        return
+
+    n_metrics = len(numeric_cols)
+    ncols = 2
+    nrows = (n_metrics + 1) // ncols
+
+    plt.style.use("seaborn-v0_8-muted")
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 4 * nrows))
+    axes = axes.flatten()
+
+    for i, metric in enumerate(numeric_cols):
+        ax = axes[i]
+        ax.plot(df["agents_num"], df[metric], marker="o", linewidth=2)
+        ax.set_title(metric.replace("_", " ").title())
+        ax.set_xlabel("Number of Agents")
+        ax.set_ylabel(metric)
+        ax.grid(True)
+
+    # Hide unused subplots if any
+    for j in range(i + 1, len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle("RLMAPF Evaluation Metrics Summary", fontsize=16, weight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+        print(f"[Plot] ✅ Saved summary plot to {save_path}")
+    else:
+        plt.show()
+
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Main evaluation function."""
@@ -317,8 +402,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     NUM_CPUS = hardware_config.get('num_cpus', 2)
     NUM_GPUS = hardware_config.get('num_gpus', 0)
     
-    # Convert checkpoint path to absolute path
-    CHECKPOINT_PATH = os.path.abspath(args.checkpoint)
+    # Resolve checkpoint path, allowing users to point at parent directories
+    raw_checkpoint_path = Path(args.checkpoint).expanduser()
+    resolved_checkpoint_path = resolve_checkpoint_path(raw_checkpoint_path.resolve())
+    CHECKPOINT_PATH = str(resolved_checkpoint_path)
     
     # Parse evaluation parameters
     agent_range_str = config.get('eval_agents_range', '4-20')
@@ -409,10 +496,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         time_results = {}
         lengths_results = {}
         deadlocks = {}
+        rewards_results = {}
+        collisions_results = {}
+        throughput_results = {}
+        efficiency_results = {}
+
         
         def run_repeat(agents_num: int, repeat: int) -> tuple:
             """Run a single evaluation repeat."""
             logger.info("Evaluating with %d agents, repeat %d/%d", agents_num, repeat + 1, REPEATS)
+            
+            info = {}  # ✅ ensure defined early
             
             # Check if we should render video for this agent count
             should_render = RENDER_VIDEO and (VIDEO_AGENTS is None or VIDEO_AGENTS == agents_num)
@@ -424,27 +518,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                 video_path = str(results_dir / video_filename)
                 logger.info("Rendering video to: %s", video_path)
             
-            # For video rendering, manually step through environment
+            # Run episode manually for rendering
             if should_render:
-                # Create environment directly with video rendering enabled
                 env_config_dict = configure_env(
                     config,
                     agents_num=agents_num,
-                    render_mode=None,  # Will be set by configure_env
+                    render_mode=None,
                     seed=42 + repeat,
                     render_video=True,
                     video_path=video_path
                 )
                 
-                # RLMAPF is already imported at the top of the file
                 env = RLMAPF(env_config_dict)
-                
-                # Load policy from checkpoint
                 temp_algorithm = algorithm_config_builder.build()
                 temp_algorithm.restore(CHECKPOINT_PATH)
                 policy = temp_algorithm.get_policy()
                 
-                # Run episode manually
                 start_time = time.time()
                 obs, info = env.reset()
                 done = False
@@ -452,30 +541,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 max_steps = env_config_dict['max_steps']
                 
                 while not done and step_count < max_steps:
-                    # Get actions from policy
-                    actions = {}
-                    for agent_id, agent_obs in obs.items():
-                        action = policy.compute_single_action(agent_obs)[0]
-                        actions[agent_id] = action
-                    
-                    # Step environment (render() called automatically inside step())
+                    actions = {agent_id: policy.compute_single_action(agent_obs)[0] for agent_id, agent_obs in obs.items()}
                     obs, rewards, dones, truncated, info = env.step(actions)
                     step_count += 1
                     done = all(dones.values()) or all(truncated.values())
                 
-                # CRITICAL: Finalize video to save it
                 env.finalize_video()
                 env.close()
-                
                 elapsed_time = time.time() - start_time
                 episode_len = step_count
                 
-                # Cleanup temporary algorithm
                 del temp_algorithm
-                
                 logger.info("Video saved to: %s", video_path)
+            
             else:
-                # Normal evaluation without video using RLlib's evaluate()
+                # RLlib internal evaluation
                 eval_config = algorithm_config_builder.environment(
                     RLMAPF,
                     env_config=configure_env(
@@ -486,7 +566,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                         render_video=False
                     )
                 )
-                
                 eval_algorithm = eval_config.build()
                 eval_algorithm.restore(CHECKPOINT_PATH)
                 
@@ -495,17 +574,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                     results = eval_algorithm.evaluate()
                     elapsed_time = time.time() - start_time
                     episode_len = results['env_runners']['episode_len_mean']
+                    # ✅ Create fake info if RLlib doesn’t provide one
+                    info = {"episode_reward": results.get('env_runners', {}).get('episode_reward_mean', np.nan)}
                 except Exception as e:
                     logger.error("Error during evaluation: %s", e)
-                    return (agents_num, repeat, None, None, 1)
+                    return (agents_num, repeat, None, None, 1, np.nan, 0, 0, np.nan)
             
-            # Check for deadlock
-            max_steps = env_config.get('max_steps', 250)
-            deadlock = 0 if episode_len < max_steps else 1
+            # ✅ Safe metrics extraction
+            collisions = info.get("total_collisions", 0)
+            reward_sum = info.get("episode_reward", np.nan)
+            optimal_len = info.get("optimal_length", np.nan)
+            throughput = episode_len / max(elapsed_time, 1e-9)
+            efficiency = (optimal_len / episode_len) if (optimal_len and episode_len) else np.nan
+            deadlock = 0 if episode_len < env_config.get('max_steps', 250) else 1
             
-            logger.debug("Completed in %.5fs, steps: %.2f", elapsed_time, episode_len)
+            logger.debug(
+                "Completed in %.4fs | steps=%d | reward=%.3f | collisions=%d | throughput=%.2f/s | eff=%.3f",
+                elapsed_time, episode_len, reward_sum, collisions, throughput, efficiency
+            )
             
-            return (agents_num, repeat, elapsed_time, episode_len, deadlock)
+            return (
+                agents_num, repeat, elapsed_time, episode_len,
+                deadlock, reward_sum, collisions, throughput, efficiency
+            )
+
+
         
         # Run evaluations for each agent count
         for agents_num in AGENTS_RANGE:
@@ -520,14 +613,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 futures = [executor.submit(run_repeat, agents_num, repeat) for repeat in range(REPEATS)]
                 
                 for future in as_completed(futures):
-                    agents_num_r, repeat_r, elapsed_time, episode_len, deadlock = future.result()
+                    (agents_num_r, repeat_r, elapsed_time, episode_len,
+                     deadlock, reward_sum, collisions, throughput, efficiency) = future.result()
+
                     
                     # Save all results, even if deadlocked
                     if elapsed_time is not None:
                         time_results[(agents_num_r, repeat_r)] = elapsed_time
                     if episode_len is not None:
                         lengths_results[(agents_num_r, repeat_r)] = episode_len
+                    rewards_results[(agents_num_r, repeat_r)] = reward_sum
+                    collisions_results[(agents_num_r, repeat_r)] = collisions
+                    throughput_results[(agents_num_r, repeat_r)] = throughput
+                    efficiency_results[(agents_num_r, repeat_r)] = efficiency
                     deadlocks[agents_num_r] += deadlock
+
             
             # Calculate and save intermediate results
             agent_time_results = [(k, v) for k, v in time_results.items() if k[0] == agents_num]
@@ -547,6 +647,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 intermediate_name = results_dir / f'intermediate_results_{agents_num}_agents'
                 
                 with open(str(intermediate_name) + '.txt', 'w') as f:
+                    avg_reward = np.nanmean([rewards_results[(agents_num, r)] for r in range(REPEATS)])
+                    avg_collisions = np.nanmean([collisions_results[(agents_num, r)] for r in range(REPEATS)])
+                    avg_throughput = np.nanmean([throughput_results[(agents_num, r)] for r in range(REPEATS)])
+                    avg_efficiency = np.nanmean([efficiency_results[(agents_num, r)] for r in range(REPEATS)])
+
+                    f.write(f"Average reward: {avg_reward:.3f}\n")
+                    f.write(f"Average collisions: {avg_collisions:.2f}\n")
+                    f.write(f"Average throughput: {avg_throughput:.2f} steps/s\n")
+                    f.write(f"Average path efficiency: {avg_efficiency:.3f}\n")
                     f.write(f"Results for {agents_num} agents:\n")
                     f.write(f"Average time: {avg_time:.5f} seconds\n")
                     f.write(f"Average length: {avg_length:.2f} steps\n")
@@ -563,8 +672,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         'agents_num': agents_num_r,
                         'repeat': repeat,
                         'elapsed_time': elapsed_time,
-                        'episode_length': lengths_results[(agents_num_r, repeat)]
+                        'episode_length': lengths_results[(agents_num_r, repeat)],
+                        'reward': rewards_results[(agents_num_r, repeat)],
+                        'collisions': collisions_results[(agents_num_r, repeat)],
+                        'throughput': throughput_results[(agents_num_r, repeat)],
+                        'path_efficiency': efficiency_results[(agents_num_r, repeat)]
                     })
+
                 
                 df = pd.DataFrame(df_data)
                 df.to_csv(str(intermediate_name) + '.csv', index=False)
@@ -583,19 +697,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                 avg_time = sum(v for _, v in agent_results) / len(agent_results)
                 agent_lengths = [(k, v) for k, v in lengths_results.items() if k[0] == agents_num]
                 avg_length = sum(v for _, v in agent_lengths) / len(agent_lengths)
+                avg_reward = np.nanmean([rewards_results[(agents_num, r)] for r in range(REPEATS)])
+                avg_collisions = np.nanmean([collisions_results[(agents_num, r)] for r in range(REPEATS)])
+                avg_throughput = np.nanmean([throughput_results[(agents_num, r)] for r in range(REPEATS)])
+                avg_efficiency = np.nanmean([efficiency_results[(agents_num, r)] for r in range(REPEATS)])
+
                 
                 summary_data.append({
                     'agents_num': agents_num,
                     'avg_time': avg_time,
                     'avg_length': avg_length,
+                    'avg_reward': avg_reward,
+                    'avg_collisions': avg_collisions,
+                    'avg_throughput': avg_throughput,
+                    'avg_efficiency': avg_efficiency,
                     'deadlocks': deadlocks[agents_num],
                     'total_runs': REPEATS,
                     'success_rate': (REPEATS - deadlocks[agents_num]) / REPEATS * 100
                 })
+
                 
-                logger.info("Agents: %2d | Time: %7.5fs | Length: %6.2f | Deadlocks: %d/%d (%.1f%% success)",
-                          agents_num, avg_time, avg_length, deadlocks[agents_num], REPEATS,
-                          (REPEATS - deadlocks[agents_num]) / REPEATS * 100)
+                logger.info(
+                    "Agents: %2d | Time: %6.3fs | Len: %5.1f | Rwd: %7.3f | Coll: %5.2f | Thr: %5.2f/s | Eff: %.3f | Dead: %d/%d (%.1f%%)",
+                    agents_num, avg_time, avg_length, avg_reward, avg_collisions,
+                    avg_throughput, avg_efficiency, deadlocks[agents_num],
+                    REPEATS, (REPEATS - deadlocks[agents_num]) / REPEATS * 100
+                )
+
         
         # Save final summary
         final_name = results_dir / 'final_results'
@@ -626,8 +754,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 'agents_num': agents_num,
                 'repeat': repeat,
                 'elapsed_time': elapsed_time,
-                'episode_length': lengths_results[(agents_num, repeat)]
+                'episode_length': lengths_results[(agents_num, repeat)],
+                'reward': rewards_results[(agents_num, repeat)],
+                'collisions': collisions_results[(agents_num, repeat)],
+                'throughput': throughput_results[(agents_num, repeat)],
+                'path_efficiency': efficiency_results[(agents_num, repeat)]
             })
+
         
         df = pd.DataFrame(df_data)
         df.to_csv(str(final_name) + '.csv', index=False)
@@ -635,7 +768,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Save summary CSV
         summary_df = pd.DataFrame(summary_data)
         summary_df.to_csv(str(results_dir / 'summary.csv'), index=False)
-        
+
+        # === Plot summary automatically ===
+        summary_csv = results_dir / "summary.csv"
+        if summary_csv.exists():
+            plot_evaluation_summary(summary_csv, results_dir / "evaluation_summary.png")
+        else:
+            logger.warning("Summary CSV not found, skipping plot generation.")
+
         logger.info("")
         logger.info("=" * 80)
         logger.info("Evaluation completed successfully!")

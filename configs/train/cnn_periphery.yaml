@@ -28,7 +28,7 @@ training:
   evaluation_enabled: true
 paths:
   save_dir: saved_models
-  experiments_root: experiments
+  experiments_root: experiments/train/cnn_periphery
   map_root: maps
 environment:
   agents_num: 20

@@ -28,7 +28,7 @@ training:
   evaluation_enabled: false
 paths:
   save_dir: saved_models
-  experiments_root: experiments
+  experiments_root: experiments/eval/cnn
   map_root: maps
 environment:
   agents_num: 20
@@ -51,7 +51,7 @@ environment:
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:
-    big_empty_1-100a-20x20: null
+    congested_center_10-10a-49x23: null
 logging:
   log_git_info: true
 # Evaluation settings (custom fields)

@@ -59,7 +59,8 @@ Useful flags:
 - `--set key=value` – override any nested value using dot notation; repeat as
   needed
 - `--run-name my-run` – force a specific run directory name
-- `--seed 123` – set `training.random_seed`
+- `--seed 123` / `--train-seed 123` – set `training.random_seed` (training environment seed). If omitted, a random seed is generated for each run.
+- `--eval-seed 42` – set `training.evaluation_seed` (evaluation environment seed). Defaults to 42 when not provided.
 - `--no-wandb` – disable Weights & Biases logging
 
 Legacy arguments (`--agents_num`, `--max_steps`, etc.) still work; they are

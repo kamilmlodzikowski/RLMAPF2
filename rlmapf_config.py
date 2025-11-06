@@ -70,6 +70,8 @@ class RunConfig:
 class HardwareConfig:
     num_cpus: int = 4
     num_gpus: float = 1.0
+    num_rollout_workers: Optional[int] = None
+    num_evaluation_workers: Optional[int] = None
     # Allows Ray resource overrides without editing script
     extra_resources: Dict[str, Any] = field(default_factory=dict)
 
@@ -102,6 +104,7 @@ class TrainingSection:
     evaluation_num_episodes: Optional[int] = None
     stop_reward_mean: Optional[float] = None
     random_seed: Optional[int] = None
+    evaluation_seed: Optional[int] = 42
 
 
 @dataclass

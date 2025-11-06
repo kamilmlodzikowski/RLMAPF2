@@ -1,4 +1,5 @@
 from copy import deepcopy
+from typing import Any, Dict, List, Optional
 import gymnasium as gym
 import ray
 from ray.rllib.env.env_context import EnvContext
@@ -22,6 +23,8 @@ class RLMAPF(MultiAgentEnv):
     """
     RLMAPF environment for multi-agent pathfinding using D* Lite algorithm.
     """
+    _MAP_CACHE: Dict[str, Dict[str, Any]] = {}
+
     def __init__(self, env_config):
         # Load environment configuration
         self.config = {**self.get_default_config(), **env_config}
@@ -39,6 +42,14 @@ class RLMAPF(MultiAgentEnv):
         self.observation_size = self.config["observation_size"]
         self.use_d_star_lite = self.config["use_d_star_lite"]
         self.start_goal_on_periphery = self.config["start_goal_on_periphery"]
+        self.cycle_maps_without_replacement = self.config.get("cycle_maps_without_replacement", False)
+        self.shuffle_map_cycle = self.config.get("shuffle_map_cycle", True)
+        self._map_cycle_queue: List[str] = []
+        self._current_map_name: Optional[str] = None
+        self._map_cycle_seed: Optional[int] = None
+        maps_config = self.config.get("maps_names_with_variants") or {}
+        self._map_usage_counter: Dict[str, int] = {str(name): 0 for name in maps_config}
+        self.print_map_usage = self.config.get("print_map_usage", True)
 
         # Set seed
         if self.config["seed"] is not None:
@@ -47,7 +58,7 @@ class RLMAPF(MultiAgentEnv):
             self._seed = np.random.randint(0, 1e9)
 
         # Check if all maps have the same size
-        self.verify_map_sizes()
+        # self.verify_map_sizes() # No longer needed
 
         # Initialize environment variables
         self.reset(self._seed)
@@ -113,8 +124,25 @@ class RLMAPF(MultiAgentEnv):
             "d_star_congestion_weight": 1.0,  # Cost multiplier per unit of congestion
             "penalize_left_side_bottom_passing": False,  # Penalize left-side/bottom passing
             "start_goal_on_periphery": False,  # Force spawn on border with mirrored goals
+            "cycle_maps_without_replacement": False,
+            "shuffle_map_cycle": True,
+            "print_map_usage": True,
         }
         return default_config
+
+    @classmethod
+    def _resolve_map_path(cls, base_path: str, map_name: str) -> str:
+        path = os.path.join(base_path, map_name)
+        if not path.endswith(".json"):
+            path = f"{path}.json"
+        return path
+
+    @classmethod
+    def _load_map_data(cls, map_path: str) -> Dict[str, Any]:
+        if map_path not in cls._MAP_CACHE:
+            with open(map_path, "r") as handle:
+                cls._MAP_CACHE[map_path] = json.load(handle)
+        return cls._MAP_CACHE[map_path]
 
     def define_observation_spaces(self):
         if self.observation_type == 'array':
@@ -237,7 +265,8 @@ class RLMAPF(MultiAgentEnv):
 
         # Load map
         if self.config["maps_names_with_variants"] is not None and len(self.config["maps_names_with_variants"]) > 0:
-            self.load_map()
+            map_name = self._next_map_name()
+            self.load_map(map_name)
         else:
             raise ValueError("No maps to load")
         
@@ -338,6 +367,12 @@ class RLMAPF(MultiAgentEnv):
         """
         self._seed = seed
         np.random.seed(seed)
+        if self.cycle_maps_without_replacement and (self._map_cycle_seed is None or self._map_cycle_seed != seed):
+            # Rebuild map cycle only when the effective seed actually changes.
+            self._map_cycle_seed = seed
+            self._map_cycle_queue = []
+            self._current_map_name = None
+        self._map_cycle_queue = []
 
     def get_seed(self):
         """
@@ -727,6 +762,10 @@ class RLMAPF(MultiAgentEnv):
             self._agent_ids = set(self._agent_ids)
         return self._agent_ids
 
+    def get_current_map_name(self) -> Optional[str]:
+        """Return the map name used for the most recent reset."""
+        return self._current_map_name
+
     def render(self, clear=True,
                title="RLMAPF Environment", 
                save_frames=False, 
@@ -840,31 +879,49 @@ class RLMAPF(MultiAgentEnv):
         if clear:
             self._ax.cla()
 
-    def load_map(self):
-        map_data = dict()
+    def _next_map_name(self) -> str:
+        if not self.config["maps_names_with_variants"]:
+            raise ValueError("No maps to load")
+        map_names = list(self.config["maps_names_with_variants"].keys())
+        if not self.cycle_maps_without_replacement:
+            return str(np.random.choice(map_names))
+        if not self._map_cycle_queue:
+            self._map_cycle_queue = map_names[:]
+            if self.shuffle_map_cycle:
+                np.random.shuffle(self._map_cycle_queue)
+        if self.shuffle_map_cycle:
+            return str(self._map_cycle_queue.pop())
+        return str(self._map_cycle_queue.pop(0))
 
-        # Choose random map
-        random_map = np.random.choice(list(self.config["maps_names_with_variants"].keys()))
+    def load_map(self, map_name: Optional[str] = None):
+        # Choose map and load map data (cached in memory to avoid repeated disk I/O)
+        if map_name is None:
+            map_name = self._next_map_name()
 
-        # Check if map ends with .json
-        random_map_path = os.path.join(self.config["map_path"], random_map)
-        if not random_map_path.endswith(".json"):
-            random_map_path = random_map_path + ".json"
+        if map_name not in self.config["maps_names_with_variants"]:
+            raise ValueError("Map {} not configured".format(map_name))
 
-        # Load map data
-        with open(random_map_path, 'r') as f:
-            # Load map data
-            map_data = json.load(f)
-        
+        random_map_path = self._resolve_map_path(self.config["map_path"], map_name)
+        map_data = deepcopy(self._load_map_data(random_map_path))
+        self._current_map_name = map_name
+        self._map_usage_counter.setdefault(map_name, 0)
+        self._map_usage_counter[map_name] += 1
+
         # Choose random variant
-        if self.config["maps_names_with_variants"][random_map] is not None:
-            random_variant = np.random.choice(self.config["maps_names_with_variants"][random_map])
+        variants = self.config["maps_names_with_variants"][map_name]
+        if variants is not None and len(variants) == 0:
+            raise ValueError("Configured variants list for map {} is empty".format(map_name))
+        if variants is not None:
+            random_variant = np.random.choice(variants)
         else:
             # Choose random variant from all variants
-            random_variant = np.random.choice(list(map_data["map_variant"].keys()))
+            available_variants = list(map_data["map_variant"].keys())
+            if not available_variants:
+                raise ValueError("No variants found for map {}".format(map_name))
+            random_variant = np.random.choice(available_variants)
 
         if random_variant is None:
-            raise ValueError("No variants found for map {}".format(random_map))
+            raise ValueError("No variants found for map {}".format(map_name))
         
         # Check number of agents:
         if self.config["agents_num"] < map_data["metadata"]["min_num_of_agents"]:
@@ -876,6 +933,18 @@ class RLMAPF(MultiAgentEnv):
         self.agent_positions = map_data["map_variant"][str(random_variant)]["starting_positions"]
         self.goal_positions = map_data["map_variant"][str(random_variant)]["goal_positions"]
 
+        if self.print_map_usage:
+            usage_summary = ", ".join(
+                f"{name}: {count}" for name, count in sorted(self._map_usage_counter.items())
+            )
+            print(
+                "[RLMAPF] Loaded map '{}' (variant {}). Usage totals -> {}".format(
+                    map_name,
+                    random_variant,
+                    usage_summary if usage_summary else "no data",
+                )
+            )
+
         # Convert from number to agent_number
         self.agent_positions = {"agent_" + str(agent): tuple(pos) for agent, pos in self.agent_positions.items()}
         self.goal_positions = {"agent_" + str(agent): tuple(pos) for agent, pos in self.goal_positions.items()}
@@ -883,20 +952,23 @@ class RLMAPF(MultiAgentEnv):
         # Convert to set
         self.obstacles = {(pos[0], pos[1]) for pos in self.obstacles}
 
+        self.grid_size = (map_data["metadata"]["width"], map_data["metadata"]["height"])
+
+    def get_map_usage_counts(self) -> Dict[str, int]:
+        """Return a copy of cumulative map usage counts for the current env instance."""
+        return dict(self._map_usage_counter)
         
     def verify_map_sizes(self):
         self.grid_size = None
         # Check if all maps have the same size
         for map_name in self.config["maps_names_with_variants"]:
-            map_path = os.path.join(self.config["map_path"], map_name+".json")
-            with open(map_path, 'r') as f:
-                # Load map data
-                map_data = json.load(f)
-                grid_size = (map_data["metadata"]["width"], map_data["metadata"]["height"])
-                if self.grid_size is None:
-                    self.grid_size = grid_size
-                elif self.grid_size != grid_size:
-                    raise ValueError("Map sizes do not match. Expected: {}, Found: {}, when processing {}".format(self.grid_size, grid_size, map_name))
+            map_path = self._resolve_map_path(self.config["map_path"], map_name)
+            map_data = self._load_map_data(map_path)
+            grid_size = (map_data["metadata"]["width"], map_data["metadata"]["height"])
+            if self.grid_size is None:
+                self.grid_size = grid_size
+            elif self.grid_size != grid_size:
+                raise ValueError("Map sizes do not match. Expected: {}, Found: {}, when processing {}".format(self.grid_size, grid_size, map_name))
 
 
 if __name__ == "__main__":

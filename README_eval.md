@@ -56,7 +56,7 @@ python eval.py \
 
 ## Output
 
-Results saved in `experiments/eval-{config}-{timestamp}/`:
+Results saved in `experiments/{config}-{timestamp}/`:
 - `summary.csv` - Main results
 - `final_results.csv` - Detailed data
 - `evaluation_Nagents_repeatR.mp4` - Videos (if enabled)

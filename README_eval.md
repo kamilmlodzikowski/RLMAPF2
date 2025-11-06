@@ -59,7 +59,7 @@ python eval.py \
 Results saved in `experiments/{config}-{timestamp}/`:
 - `summary.csv` - Main results
 - `final_results.csv` - Detailed data
-- `evaluation_Nagents_repeatR.mp4` - Videos (if enabled)
+- `evaluation_{N}agents_repeat{R}.mp4` - Videos (if enabled, R is zero-based)
 
 ## Common Commands
 

@@ -48,6 +48,7 @@ environment:
   reward_closer_to_goal_each_step: false
   reward_low_density: false
   penalize_left_side_bottom_passing: true
+  start_goal_on_periphery: false
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:

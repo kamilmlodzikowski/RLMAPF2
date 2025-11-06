@@ -36,7 +36,7 @@ python eval.py \
 
 ### Optional
 - `--render-video` - Enable video generation
-- `--video-agents N` - Generate video only for N agents (default: all)
+- `--video-agents N` - Generate video only for N agents (default: all). Requires `--render-video` to be set.
 - `--repeats N` - Number of evaluation repeats (default: from config)
 - `--num-threads N` - Parallel evaluation threads (default: 1)
 - `--set KEY=VALUE` - Override config values

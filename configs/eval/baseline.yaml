@@ -51,5 +51,5 @@ environment:
 logging:
   log_git_info: true
 # Evaluation settings (custom fields)
-eval_agents_range: "4-6"
+eval_agents_range: "4-20"
 eval_video_fps: 10

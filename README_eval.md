@@ -51,7 +51,7 @@ python eval.py \
 --set environment.max_steps=500
 
 # Multiple overrides
---set eval_agents_range=4-10 --set eval_repeats=5
+--set eval_agents_range=4-10 --repeats 5
 ```
 
 ## Output

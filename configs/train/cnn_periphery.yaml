@@ -26,6 +26,8 @@ training:
   eval_interval: 25
   evaluation_duration: 10
   evaluation_enabled: true
+  random_seed: null
+  evaluation_seed: 42
 paths:
   save_dir: saved_models
   experiments_root: experiments

@@ -1,10 +1,10 @@
 run:
-  name_prefix: cnn-congestion-dstar
-  project: rlmapf_congestion
-  group: cnn_congestion_spread
+  name_prefix: cnn-iterative-dstar
+  project: rlmapf_iterative_dstar
+  group: cnn_iterative_baseline
   use_wandb: true
-  tags: [cnn, d_star, congestion]
-  notes: "CNN observation with congestion-aware D* Lite (4 iterations, weight 0.5)."
+  tags: [cnn, d_star, iterative]
+  notes: "CNN observation with modified iterative D* Lite planner on PPRai layout."
 hardware:
   num_cpus: 4
   num_gpus: 1
@@ -38,8 +38,8 @@ environment:
   reward_closer_to_goal_final: true
   reward_final_d_star: false
   use_d_star_lite: true
-  d_star_iterations: 4
-  d_star_congestion_weight: 0.5
+  d_star_iterations: 3
+  d_star_congestion_weight: 1.0
   use_cnn_observation: true
   collision_penalty: 0.1
   step_cost: 0.02
@@ -52,20 +52,19 @@ environment:
   reward_closer_to_goal_each_step: false
   reward_low_density: false
   penalize_left_side_bottom_passing: false
-  start_goal_on_periphery: true
   render_mode: none
   render_delay: 0.01
   maps_names_with_variants:
-    grid_1-100a-20x23: null
+    pprai_1-20a-42x39: null
 evaluation_environment:
-  max_steps: 200
-  step_cost: 0.01
+  max_steps: 250
+  step_cost: 0.015
   wait_cost_multiplier: 2
   reward_closer_to_goal_final: true
   reward_final_d_star: false
   use_d_star_lite: true
-  d_star_iterations: 4
-  d_star_congestion_weight: 0.5
+  d_star_iterations: 3
+  d_star_congestion_weight: 1.0
   penalize_left_side_bottom_passing: false
 logging:
   params_to_log:

@@ -204,7 +204,9 @@ def configure_env(config: Dict[str, Any], agents_num: Optional[int] = None,
     # Use provided values or defaults from config
     agents_num = agents_num if agents_num is not None else env_config['agents_num']
     
-    # CRITICAL: For video rendering, use "human" mode (not "rgb_array")!
+    # Override render_mode when rendering videos
+    # Video rendering requires "human" mode, while config specifies "rgb_array" 
+    # for non-video evaluation runs
     if render_video:
         render_mode = "human"
     else:

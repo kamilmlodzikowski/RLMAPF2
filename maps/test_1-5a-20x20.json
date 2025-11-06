@@ -1,0 +1,55 @@
+{
+    "metadata": {
+        "name": "test",
+        "min_num_of_agents": 1,
+        "max_num_of_agents": 5,
+        "width": 20,
+        "height": 20
+    },
+    "map_raw": [
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "          XX        ",
+        "          XX        ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    "
+    ],
+    "map_variant": {
+        "0": {
+            "obstacles": [
+                [
+                    10,
+                    9
+                ],
+                [
+                    11,
+                    9
+                ],
+                [
+                    10,
+                    10
+                ],
+                [
+                    11,
+                    10
+                ]
+            ],
+            "starting_positions": {},
+            "goal_positions": {}
+        }
+    }
+}

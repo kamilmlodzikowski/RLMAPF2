@@ -12,4 +12,5 @@ wandb
 __pycache__
 saved_models/
 experiments/
+dstar/
 .venv/

@@ -45,8 +45,8 @@ def main() -> None:
     parser.add_argument("config_file", type=Path, help="File with one set of args per line")
     parser.add_argument("--max_concurrent_trials", type=int, default=5,
                         help="Maximum number of concurrent training runs")
-    parser.add_argument("--gpus-per-trial", type=float, default=1,
-                        help="Number of GPUs to allocate per trial (default: 1)")
+    parser.add_argument("--gpus-per-trial", type=float, default=0.25,
+                        help="Number of GPUs to allocate per trial (default: 0.25)")
     parser.add_argument(
         "--use_cnn_observation",
         action="store_true",

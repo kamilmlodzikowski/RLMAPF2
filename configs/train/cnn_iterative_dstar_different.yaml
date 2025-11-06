@@ -1,13 +1,15 @@
 run:
-  name_prefix: cnn
-  project: rlmapf_big_empty
-  group: cnn
+  name_prefix: cnn-iterative-dstar
+  project: rlmapf_iterative_dstar_different_2
+  group: cnn_iterative_baseline
   use_wandb: true
-  tags: [cnn, complex_input]
-  notes: "CNN-based observation with conv filters"
+  tags: [cnn, d_star, iterative]
+  notes: "CNN observation with modified iterative D* Lite planner on slots."
 hardware:
   num_cpus: 4
   num_gpus: 1
+  num_rollout_workers: 6
+  num_evaluation_workers: 1
 model:
   framework: torch
   api_stack:
@@ -34,10 +36,12 @@ paths:
   map_root: maps
 environment:
   agents_num: 20
-  max_steps: 250
-  reward_closer_to_goal_final: true
-  reward_final_d_star: false
-  use_d_star_lite: false
+  max_steps: 500
+  reward_closer_to_goal_final: false
+  reward_final_d_star: true
+  use_d_star_lite: true
+  d_star_iterations: 3
+  d_star_congestion_weight: 1.0
   use_cnn_observation: true
   collision_penalty: 0.1
   step_cost: 0.02
@@ -49,18 +53,35 @@ environment:
   penalize_steps: true
   reward_closer_to_goal_each_step: false
   reward_low_density: false
-  penalize_left_side_bottom_passing: true
+  penalize_left_side_bottom_passing: false
   render_mode: none
   render_delay: 0.01
+  cycle_maps_without_replacement: true
+  shuffle_map_cycle: true
   maps_names_with_variants:
     big_empty_1-100a-20x20: null
+    grid_1-100a-20x23: null
+    pprai_1-20a-42x39: null
+    basic1_1-100a-35x35: null
+    basic2_1-100a-35x35: null
+    basic3_1-100a-45x35: null
+    maze1_1-100a-30x30: null
+    maze2_1-100a-30x30: null
+    maze3_1-100a-30x30: null
+    maze4_1-100a-30x30: null
 evaluation_environment:
-  max_steps: 200
-  step_cost: 0.01
+  agents_num: 10
+  max_steps: 250
+  step_cost: 0.015
   wait_cost_multiplier: 2
   reward_closer_to_goal_final: true
   reward_final_d_star: false
+  use_d_star_lite: true
+  d_star_iterations: 3
+  d_star_congestion_weight: 1.0
   penalize_left_side_bottom_passing: false
+  maps_names_with_variants:
+    slots_10-10a-39x29: null
 logging:
   params_to_log:
     - env_runners/episode_reward_mean

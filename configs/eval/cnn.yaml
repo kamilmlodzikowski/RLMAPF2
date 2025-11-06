@@ -1,0 +1,60 @@
+run:
+  name_prefix: cnn
+  project: rlmapf_big_empty
+  group: cnn
+  use_wandb: true
+  tags: [evaluation, cnn]
+  notes: "Evaluation of CNN PPO model"
+hardware:
+  num_cpus: 4
+  num_gpus: 1
+model:
+  framework: torch
+  api_stack:
+    enable_rl_module_and_learner: false
+    enable_env_runner_and_connector_v2: false
+  model:
+    conv_activation: relu
+    conv_filters:
+      - [32, [3, 3], 1]
+      - [64, [3, 3], 1]
+      - [64, [3, 3], 1]
+    fcnet_hiddens: [512, 256]
+training:
+  episodes: 1
+  save_interval: 500
+  eval_interval: 50
+  evaluation_duration: 10
+  evaluation_enabled: false
+paths:
+  save_dir: saved_models
+  experiments_root: experiments
+  map_root: maps
+environment:
+  agents_num: 20
+  max_steps: 250
+  reward_closer_to_goal_final: true
+  reward_final_d_star: false
+  use_d_star_lite: false
+  use_cnn_observation: true
+  collision_penalty: 0.1
+  step_cost: 0.02
+  wait_cost_multiplier: 2
+  goal_reward: 10
+  observation_type: array
+  penalize_collision: true
+  penalize_waiting: true
+  penalize_steps: true
+  reward_closer_to_goal_each_step: false
+  reward_low_density: false
+  penalize_left_side_bottom_passing: true
+  start_goal_on_periphery: false
+  render_mode: rgb_array
+  render_delay: 0.01
+  maps_names_with_variants:
+    big_empty_1-100a-20x20: null
+logging:
+  log_git_info: true
+# Evaluation settings (custom fields)
+eval_agents_range: "10-20"
+eval_video_fps: 10

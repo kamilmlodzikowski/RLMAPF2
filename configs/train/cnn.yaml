@@ -51,7 +51,7 @@ environment:
   render_mode: none
   render_delay: 0.01
   maps_names_with_variants:
-    congested_center_10-10a-49x23: null
+    pprai_1-20a-42x39: null
 evaluation_environment:
   max_steps: 200
   step_cost: 0.01

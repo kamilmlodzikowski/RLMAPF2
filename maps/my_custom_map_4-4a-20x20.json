@@ -1,0 +1,38 @@
+{
+    "metadata": {
+        "name": "my_custom_map",
+        "min_num_of_agents": 4,
+        "max_num_of_agents": 4,
+        "width": 20,
+        "height": 20
+    },
+    "map_raw": [
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    ",
+        "                    "
+    ],
+    "map_variant": {
+        "0": {
+            "obstacles": [],
+            "starting_positions": {},
+            "goal_positions": {}
+        }
+    }
+}

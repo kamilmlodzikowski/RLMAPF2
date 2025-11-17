@@ -94,6 +94,8 @@ class RLMAPF(MultiAgentEnv):
                 "render_delay": 0.2,
                 "save_frames": False,
                 "frames_path": "frames/",
+                "smooth_motion": False,
+                "motion_frames": 5,
             },
             "seed": None, # int or None
             "map_path": os.getcwd() + "/maps/",
@@ -275,16 +277,18 @@ class RLMAPF(MultiAgentEnv):
 
         # Render
         if self.render_mode == "human":
-            self.render(clear=False, 
+            self.render(clear=False,
                         title=self.render_config["title"],
-                        save_frames=self.render_config["save_frames"], 
-                        frames_path=self.render_config["frames_path"], 
-                        save_video=self.render_config["save_video"], 
+                        save_frames=self.render_config["save_frames"],
+                        frames_path=self.render_config["frames_path"],
+                        save_video=self.render_config["save_video"],
                         video_path=self.render_config["video_path"],
                         show_render=self.render_config["show_render"],
                         render_delay=self.render_config["render_delay"],
                         include_legend=self.render_config["include_legend"],
-                        legend_position=self.render_config["legend_position"])
+                        legend_position=self.render_config["legend_position"],
+                        smooth_motion=self.render_config.get("smooth_motion", False),
+                        motion_frames=self.render_config.get("motion_frames", 5))
 
         return self._get_observations(), self._get_info()
 
@@ -367,10 +371,10 @@ class RLMAPF(MultiAgentEnv):
             
             # Penalize for moving
             if action != 4:
-                if self.config["penalize_waiting"]:
+                if self.config["penalize_steps"]:
                     penalize(agent, penalty=self.step_cost)
             else:
-                if self.config["penalize_steps"]:
+                if self.config["penalize_waiting"]:
                     penalize(agent, penalty=self.step_cost*self.wait_cost_multiplier)
 
             new_state[agent] = new_pos
@@ -496,16 +500,18 @@ class RLMAPF(MultiAgentEnv):
 
         # Render
         if self.render_mode == "human":
-            self.render(clear=False, 
+            self.render(clear=False,
                         title=self.render_config["title"],
-                        save_frames=self.render_config["save_frames"], 
-                        frames_path=self.render_config["frames_path"], 
-                        save_video=self.render_config["save_video"], 
+                        save_frames=self.render_config["save_frames"],
+                        frames_path=self.render_config["frames_path"],
+                        save_video=self.render_config["save_video"],
                         video_path=self.render_config["video_path"],
                         show_render=self.render_config["show_render"],
                         render_delay=self.render_config["render_delay"],
                         include_legend=self.render_config["include_legend"],
-                        legend_position=self.render_config["legend_position"])
+                        legend_position=self.render_config["legend_position"],
+                        smooth_motion=self.render_config.get("smooth_motion", False),
+                        motion_frames=self.render_config.get("motion_frames", 5))
             
 
         return self._get_observations(), self.rewards, terminateds, truncateds, self._get_info()
@@ -909,7 +915,11 @@ class RLMAPF(MultiAgentEnv):
         self.grid_size = None
         # Check if all maps have the same size
         for map_name in self.config["maps_names_with_variants"]:
-            map_path = os.path.join(self.config["map_path"], map_name+".json")
+            # Check if map ends with .json
+            random_map_path = os.path.join(self.config["map_path"], map_name)
+            if not random_map_path.endswith(".json"):
+                random_map_path = random_map_path + ".json"
+            map_path = random_map_path
             with open(map_path, 'r') as f:
                 # Load map data
                 map_data = json.load(f)

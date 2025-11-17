@@ -51,9 +51,12 @@ environment:
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:
-    congested_center_10-10a-49x23: null
+    pprai_1-20a-42x39: null
 logging:
   log_git_info: true
 # Evaluation settings (custom fields)
 eval_agents_range: "10-20"
 eval_video_fps: 10
+# Video rendering settings
+smooth_motion: false  # Enable smooth motion with interpolation (set to true for smoother videos)
+motion_frames: 5      # Number of interpolation frames per step (higher = smoother but larger file)

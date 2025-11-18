@@ -15,7 +15,7 @@ pip install ray[rllib] numpy pandas pyyaml matplotlib
 ```bash
 python eval.py \
     --config baseline \
-    --checkpoint experiments/baseline-TIMESTAMP/checkpoints/baseline-TIMESTAMP_final
+    --checkpoint 1
 ```
 
 ### With Video Rendering
@@ -23,7 +23,7 @@ python eval.py \
 ```bash
 python eval.py \
     --config baseline \
-    --checkpoint experiments/baseline-TIMESTAMP/checkpoints/baseline-TIMESTAMP_final \
+    --checkpoint 1 \
     --render-video \
     --video-agents 20
 ```
@@ -32,7 +32,7 @@ python eval.py \
 
 ### Required
 - `--config NAME` - Config file (in `configs/eval/`) or path to YAML
-- `--checkpoint PATH` - Path to trained model checkpoint
+- `--checkpoint N` - Checkpoint number (1 = most recent, 2 = second most recent, etc.) or full path
 
 ### Optional
 - `--render-video` - Enable video generation
@@ -40,6 +40,13 @@ python eval.py \
 - `--repeats N` - Number of evaluation repeats (default: from config)
 - `--num-threads N` - Parallel evaluation threads (default: 1)
 - `--set KEY=VALUE` - Override config values
+
+### Video Rendering Options
+
+Videos now support **smooth motion** with interpolated agent movements between steps:
+- `eval_smooth_motion: true/false` - Enable smooth interpolation (default: true)
+- `eval_motion_frames: N` - Interpolation frames per step (default: 5, higher = smoother)
+- `eval_video_fps: N` - Base FPS (default: 10, actual FPS = fps × motion_frames when smooth)
 
 ### Override Examples
 
@@ -49,6 +56,12 @@ python eval.py \
 
 # Change max steps
 --set environment.max_steps=500
+
+# Disable smooth motion for faster rendering
+--set eval_smooth_motion=false
+
+# Increase smoothness (more interpolation frames)
+--set eval_motion_frames=10
 
 # Multiple overrides
 --set eval_agents_range=4-10 --repeats 5
@@ -64,27 +77,33 @@ Results saved in `experiments/{config}-{timestamp}/`:
 ## Common Commands
 
 ```bash
-# Quick test (few agents, few repeats)
-python eval.py --config baseline --checkpoint path \
+# Quick test (few agents, few repeats) - use most recent checkpoint
+python eval.py --config baseline --checkpoint 1 \
     --set eval_agents_range=4-6 --repeats 2
 
 # Full evaluation (statistics only, no video)
-python eval.py --config baseline --checkpoint path \
+python eval.py --config baseline --checkpoint 1 \
     --set eval_agents_range=4-20 --repeats 10 --num-threads 4
 
 # Generate single demo video
-python eval.py --config baseline --checkpoint path \
+python eval.py --config baseline --checkpoint 1 \
     --render-video --video-agents 20
 
 # Full evaluation + one video
-python eval.py --config baseline --checkpoint path \
+python eval.py --config baseline --checkpoint 1 \
     --render-video --video-agents 20 \
     --set eval_agents_range=4-20 --repeats 10
+
+# Use second most recent checkpoint
+python eval.py --config baseline --checkpoint 2 \
+    --render-video --video-agents 20
 ```
 
 ## Notes
 
-- Checkpoint path must point to the checkpoint folder (contains `algorithm_state.pkl`)
-- Video rendering is slow (~2-3 min per video)
+- **Checkpoint shortcuts**: Use numbers (1, 2, 3...) where 1 = most recent, 2 = second most recent, etc.
+- Full paths also work: `experiments/baseline-TIMESTAMP/checkpoints/baseline-TIMESTAMP_final`
+- Checkpoint folder must contain `algorithm_state.pkl`
+- Video rendering is slow (~2-3 min per video with smooth motion)
 - Use `--video-agents N` to render only specific agent count
 - Results include git commit hash for reproducibility

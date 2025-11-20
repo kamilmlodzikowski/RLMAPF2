@@ -77,6 +77,15 @@ class HardwareConfig:
 
 
 @dataclass
+class RecurrentConfig:
+    enabled: bool = False
+    cell_size: int = 256
+    max_seq_len: int = 20
+    use_prev_action: Optional[bool] = None
+    use_prev_reward: Optional[bool] = None
+
+
+@dataclass
 class ModelConfig:
     framework: str = "torch"
     api_stack: Dict[str, Any] = field(
@@ -92,6 +101,7 @@ class ModelConfig:
         }
     )
     resources: Dict[str, Any] = field(default_factory=dict)
+    recurrent: RecurrentConfig = field(default_factory=RecurrentConfig)
 
 
 @dataclass
@@ -159,6 +169,7 @@ class TrainConfig:
         merged_dict["model"]["api_stack"] = dict(base.model.api_stack)
         merged_dict["model"]["model"] = dict(base.model.model)
         merged_dict["model"]["resources"] = dict(base.model.resources)
+        merged_dict["model"]["recurrent"] = asdict(base.model.recurrent)
         merged_dict["logging"]["best_metrics"] = dict(base.logging.best_metrics)
 
         _deep_update(merged_dict, data)
@@ -171,6 +182,13 @@ class TrainConfig:
                 api_stack=dict(merged_dict["model"].get("api_stack", {})),
                 model=dict(merged_dict["model"].get("model", {})),
                 resources=dict(merged_dict["model"].get("resources", {})),
+                recurrent=RecurrentConfig(
+                    **(
+                        merged_dict["model"].get("recurrent")
+                        if isinstance(merged_dict["model"].get("recurrent"), dict)
+                        else {}
+                    )
+                ),
             ),
             training=TrainingSection(**merged_dict["training"]),
             environment=dict(merged_dict.get("environment", {})),

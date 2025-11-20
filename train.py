@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
 
 import matplotlib.pyplot as plt
 
@@ -40,6 +41,28 @@ except ImportError:  # pragma: no cover
 
 LOG_LEVEL = logging.INFO
 logger = logging.getLogger("train")
+
+
+class SuccessCallbacks(DefaultCallbacks):
+    """Track percentage of agents reaching their goal each episode."""
+
+    def on_episode_end(self, worker, base_env, policies, episode, **kwargs):  # type: ignore[override]
+        try:
+            # Single environment instance per rollout worker expected here.
+            sub_envs = base_env.get_sub_environments()  # type: ignore[attr-defined]
+            if not sub_envs:
+                return
+            env = sub_envs[0]
+        except Exception:
+            return
+
+        successes = getattr(env, "successful_agents", None)
+        initial = getattr(env, "initial_agents_num", None)
+        if successes is None or initial is None or initial <= 0:
+            return
+        success_rate = float(successes) / float(initial)
+        # Store as percentage for easier reading in dashboards.
+        episode.custom_metrics["success_rate_pct"] = success_rate * 100.0
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -273,6 +296,23 @@ def prepare_model_config(config: TrainConfig) -> Dict[str, Any]:
             ],
             "fcnet_hiddens": [512, 256],
         })
+    recurrent_cfg = config.model.recurrent
+    if recurrent_cfg.enabled:
+        model_config["use_lstm"] = True
+        if recurrent_cfg.cell_size is not None and "lstm_cell_size" not in model_config:
+            model_config["lstm_cell_size"] = recurrent_cfg.cell_size
+        if recurrent_cfg.max_seq_len is not None and "max_seq_len" not in model_config:
+            model_config["max_seq_len"] = recurrent_cfg.max_seq_len
+        if (
+            recurrent_cfg.use_prev_action is not None
+            and "lstm_use_prev_action" not in model_config
+        ):
+            model_config["lstm_use_prev_action"] = recurrent_cfg.use_prev_action
+        if (
+            recurrent_cfg.use_prev_reward is not None
+            and "lstm_use_prev_reward" not in model_config
+        ):
+            model_config["lstm_use_prev_reward"] = recurrent_cfg.use_prev_reward
     return model_config
 
 
@@ -289,23 +329,26 @@ def _normalise_metric_value(raw_value: Any) -> Optional[Any]:
         return raw_value
 
     if isinstance(raw_value, np.generic):
-        return raw_value.item()
+        raw_value = raw_value.item()
 
     if isinstance(raw_value, numbers.Integral):
         return int(raw_value)
 
     if isinstance(raw_value, numbers.Real):
-        return float(raw_value)
+        value = float(raw_value)
+        return value if math.isfinite(value) else None
 
     if isinstance(raw_value, numbers.Number):
         try:
-            return float(raw_value)
+            value = float(raw_value)
+            return value if math.isfinite(value) else None
         except TypeError:
             return None
 
     if isinstance(raw_value, np.ndarray):
         if raw_value.size == 1:
-            return raw_value.item()
+            scalar = raw_value.item()
+            return _normalise_metric_value(scalar)
         return None
 
     if hasattr(raw_value, "item"):
@@ -313,8 +356,9 @@ def _normalise_metric_value(raw_value: Any) -> Optional[Any]:
             item_value = raw_value.item()
         except Exception:  # pragma: no cover - defensive fallback
             item_value = None
-        if isinstance(item_value, numbers.Number):
-            return item_value
+        if isinstance(item_value, numbers.Real):
+            value = float(item_value)
+            return value if math.isfinite(value) else None
 
     return None
 
@@ -439,9 +483,13 @@ def record_policy_video(
 
     env = None
     try:
+        # For render-only rollouts we do not want to reuse the evaluation seed;
+        # drop it so the video samples a fresh map/layout like the live evals.
+        recording_seed = env_config.pop("seed", None)
         env = RLMAPF(env_config)
-        seed = env_config.get("seed")
-        observations, _ = env.reset(seed=seed)
+        if recording_seed is not None:
+            logger.debug("Record policy video ignoring fixed seed %s to capture varied layouts", recording_seed)
+        observations, _ = env.reset()  # Random seed to avoid repeating the same map
         max_steps = max_render_steps or env_config.get("max_steps") or env.max_steps
         step = 0
         while step < max_steps:
@@ -598,6 +646,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         .training(model=model_config)
         .env_runners(num_env_runners=rollout_workers)
         .environment(RLMAPF, env_config=env_config)
+        .callbacks(SuccessCallbacks)
     )
 
     if config.training.evaluation_enabled:
@@ -629,6 +678,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     metric_paths = [metric.split("/") for metric in config.logging.params_to_log]
+    success_metric_primary = ["custom_metrics", "success_rate_pct_mean"]
+    success_metric_alt = ["env_runners", "custom_metrics", "success_rate_pct_mean"]
+    if success_metric_primary not in metric_paths:
+        metric_paths.append(success_metric_primary)
+    if success_metric_alt not in metric_paths:
+        metric_paths.append(success_metric_alt)
     evaluation_metric_paths = [["evaluation"] + path for path in metric_paths]
     best_metrics: Dict[str, Dict[str, Any]] = {}
 
@@ -686,20 +741,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                             )
                             if eval_video_path is None:
                                 logger.warning("Evaluation video recording failed for episode %s", episode)
+                            else:
+                                video_fps = (
+                                    video_env_config_for_eval.get("render_config", {}).get("video_fps")
+                                    if isinstance(video_env_config_for_eval.get("render_config"), dict)
+                                    else None
+                                )
+                                wandb_run.log(
+                                    {
+                                        "evaluation/video": wandb.Video(
+                                            str(eval_video_path),
+                                            fps=video_fps or 10,
+                                            format="mp4",
+                                        )
+                                    },
+                                    step=episode,
+                                    commit=False,
+                                )
 
                     if config.run.use_wandb and wandb_run is not None:
                         wandb_payload = dict(train_metrics)
-                        if eval_video_path is not None:
-                            video_fps = (
-                                video_env_config_for_eval.get("render_config", {}).get("video_fps")
-                                if isinstance(video_env_config_for_eval.get("render_config"), dict)
-                                else None
-                            )
-                            wandb_payload["evaluation/video"] = wandb.Video(
-                                str(eval_video_path),
-                                fps=video_fps or 10,
-                                format="mp4",
-                            )
                         wandb_run.log(wandb_payload, step=episode)
 
                     if (
@@ -746,7 +807,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                         wandb_run.summary[f"best/{key}"] = entry["value"]
                         wandb_run.summary[f"best_episode/{key}"] = entry["episode"]
                     if video_output_path is not None:
-                        wandb_run.summary["video/demo"] = str(video_output_path)
+                        video_fps = (
+                            video_env_config_for_eval.get("render_config", {}).get("video_fps")
+                            if isinstance(video_env_config_for_eval.get("render_config"), dict)
+                            else None
+                        )
+                        wandb_run.log(
+                            {
+                                "video/demo": wandb.Video(
+                                    str(video_output_path),
+                                    fps=video_fps or 10,
+                                    format="mp4",
+                                )
+                            },
+                            step=config.training.episodes,
+                        )
+                        wandb_run.summary["video/demo_path"] = str(video_output_path)
             except KeyboardInterrupt:
                 logger.warning("Interrupted by user. Saving latest checkpoint before exit.")
                 if algorithm is not None:

@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import gymnasium as gym
 import ray
@@ -63,6 +64,10 @@ class RLMAPF(MultiAgentEnv):
         # Check if all maps have the same size
         # self.verify_map_sizes() # No longer needed
 
+        # Debug visualization accumulators
+        self._dstar_gif_writer = None
+        self._dstar_debug_frame_idx = 0
+
         # Initialize environment variables
         self.reset(self._seed)
         
@@ -78,6 +83,7 @@ class RLMAPF(MultiAgentEnv):
         if self.use_d_star_lite:
             self.d_star_maps = {}
             self.d_star_paths = {}
+            self.d_star_planned_paths = {}
             self.start_d_star_paths = {}
             self.d_stars = {}
 
@@ -110,6 +116,13 @@ class RLMAPF(MultiAgentEnv):
                 "save_frames": False,
                 "frames_path": "frames/",
             },
+            "d_star_debug": {
+                "save_gif": False,
+                "gif_path": "dstar_debug.gif",
+                "gif_fps": 5,
+                "save_pngs": False,
+                "png_dir": "dstar_debug_frames",
+            },
             "seed": None, # int or None
             "map_path": os.getcwd() + "/maps/",
             "maps_names_with_variants": { # map_name: variants, if variants is None, then all variants are loaded
@@ -124,8 +137,8 @@ class RLMAPF(MultiAgentEnv):
             "reward_closer_to_goal_final": False,
             "reward_final_d_star": True,
             "use_d_star_lite": True,  # Enable or disable D* Lite
-            "d_star_iterations": 1,  # Number of congestion-based replanning rounds
-            "d_star_congestion_weight": 1.0,  # Cost multiplier per unit of congestion
+            "d_star_iterations": 5,  # Number of congestion-based replanning rounds
+            "d_star_congestion_weight": 5.0,  # Cost multiplier per unit of congestion
             "d_star_path_progress_weight": 0.0,  # Reward scaling for reducing D* path length step-to-step
             "penalize_left_side_bottom_passing": False,  # Penalize left-side/bottom passing
             "start_goal_on_periphery": False,  # Force spawn on border with mirrored goals
@@ -156,7 +169,7 @@ class RLMAPF(MultiAgentEnv):
                 # Channels: obstacles, agents_positions, and optionally
                 # d_star_path, d_star_path_others when D* Lite is enabled.
                 # channels = 2 + (2 if self.use_d_star_lite else 0) 
-                channels = 3 if self.use_d_star_lite else 2 # NO OTHER D* PATHS, CHANGE BACK TO 4
+                channels = 3 if self.use_d_star_lite else 2 
                 self.observation_space = gym.spaces.Dict({
                     'grid': gym.spaces.Box(
                         low=0.0, high=1.0,
@@ -172,7 +185,7 @@ class RLMAPF(MultiAgentEnv):
                 if self.use_d_star_lite:
                     self.observation_space = gym.spaces.Dict({
                         'd_star_path': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
-                        # 'd_star_path_others': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
+                        'd_star_path_others': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
                         'distance_to_goal': gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
                         'agents_positions': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
                         'obstacles': gym.spaces.Box(low=0.0, high=1.0, shape=(self.observation_size, self.observation_size), dtype=np.float32),
@@ -275,6 +288,15 @@ class RLMAPF(MultiAgentEnv):
         if seed is not None:
             self.set_seed(seed)
 
+        # Reset debug GIF state
+        if getattr(self, "_dstar_gif_writer", None) is not None:
+            try:
+                self._dstar_gif_writer.close()
+            except Exception:
+                pass
+            self._dstar_gif_writer = None
+        self._dstar_debug_frame_idx = 0
+
         # # Reset environment variables
         # # TODO: REMOVE
         # self.config["agents_num"] = 8
@@ -330,39 +352,44 @@ class RLMAPF(MultiAgentEnv):
 
             iterations = max(1, int(self.config.get("d_star_iterations", 1)))
             congestion_weight = float(self.config.get("d_star_congestion_weight", 1.0))
-
-            if iterations > 1:
-                _, traversal_costs = iterative_congestion_d_star(
-                    self.grid_size[0],
-                    self.grid_size[1],
-                    d_star_obstacles,
-                    {agent: self.agent_positions[agent] for agent in self._agent_ids},
-                    {agent: self.goal_positions[agent] for agent in self._agent_ids},
-                    iterations=iterations,
-                    congestion_weight=congestion_weight,
-                )
-            else:
-                traversal_costs = np.ones(self.grid_size, dtype=np.float32)
+            planned_paths, traversal_costs = iterative_congestion_d_star(
+                self.grid_size[0],
+                self.grid_size[1],
+                d_star_obstacles,
+                {agent: self.agent_positions[agent] for agent in self._agent_ids},
+                {agent: self.goal_positions[agent] for agent in self._agent_ids},
+                iterations=iterations,
+                congestion_weight=congestion_weight,
+            )
 
             self.d_star_maps = {}
             self.d_stars = {}
             self.d_star_paths = {}
+            self.d_star_planned_paths = deepcopy(planned_paths)
 
+            shared_occupancy_map = OccupancyGridMap(self.grid_size[0], self.grid_size[1])
+            shared_occupancy_map.set_map(d_star_obstacles)
+            shared_occupancy_map.set_traversal_costs(traversal_costs)
             for agent in self._agent_ids:
-                occupancy_map = OccupancyGridMap(self.grid_size[0], self.grid_size[1])
-                occupancy_map.set_map(d_star_obstacles)
-                occupancy_map.set_traversal_costs(traversal_costs)
-                planner = DStarLite(occupancy_map, self.agent_positions[agent], self.goal_positions[agent])
+                planner = DStarLite(
+                    shared_occupancy_map,
+                    self.agent_positions[agent],
+                    self.goal_positions[agent],
+                )
 
-                self.d_star_maps[agent] = occupancy_map
+                self.d_star_maps[agent] = shared_occupancy_map
                 self.d_stars[agent] = planner
 
-                path, _, _ = planner.move_and_replan(self.agent_positions[agent])
+                path = planned_paths.get(agent)
+                if path is None:
+                    path, _, _ = planner.move_and_replan(self.agent_positions[agent])
                 self.d_star_paths[agent] = path
 
-            self.start_d_star_paths = deepcopy(self.d_star_paths)
+            self.start_d_star_paths = deepcopy(self.d_star_planned_paths)
 
         # Render
+        self._maybe_capture_d_star_step_frame(is_reset=True)
+
         if self.render_mode == "human":
             self.render(clear=False, 
                         title=self.render_config["title"],
@@ -558,9 +585,19 @@ class RLMAPF(MultiAgentEnv):
                 prev_d_star_lengths = {
                     agent: len(self.d_star_paths.get(agent, [])) for agent in self._agent_ids
                 }
+            planned_paths_static = getattr(self, "d_star_planned_paths", {})
             for agent in self._agent_ids:
-                path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
-                self.d_star_paths[agent] = path
+                full_path = planned_paths_static.get(agent, []) if planned_paths_static else []
+                if full_path and self.agent_positions[agent] in full_path:
+                    idx = full_path.index(self.agent_positions[agent])
+                    self.d_star_paths[agent] = full_path[idx:]
+                else:
+                    path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
+                    self.d_star_paths[agent] = path
+                    # Update the static reference if we had to deviate from the preplanned path.
+                    if planned_paths_static is not None:
+                        planned_paths_static[agent] = path
+
             if d_star_progress_weight != 0.0:
                 for agent in self._agent_ids:
                     prev_len = prev_d_star_lengths.get(agent)
@@ -572,6 +609,8 @@ class RLMAPF(MultiAgentEnv):
                     delta = prev_len - new_len  # Positive when the planned path to goal shrinks
                     if delta != 0:
                         reward(agent, reward=d_star_progress_weight * delta)
+
+        self._maybe_capture_d_star_step_frame(is_reset=False)
 
         for agent, new_pos in self.agent_positions.items():
             # Check for reaching goal positions and update rewards
@@ -728,8 +767,11 @@ class RLMAPF(MultiAgentEnv):
 
         # Include D* Lite paths only if enabled
         if self.use_d_star_lite:
+            paths_for_obs = getattr(self, "d_star_paths", None)
+            if not paths_for_obs:
+                paths_for_obs = getattr(self, "d_star_planned_paths", {}) or {}
             d_star_path_arrays = {agent: np.zeros((self.observation_size, self.observation_size), dtype=np.float32) for agent in self._agent_ids}
-            for agent, path in self.d_star_paths.items():
+            for agent, path in paths_for_obs.items():
                 if agent not in self._agent_ids:
                     continue
                 
@@ -756,7 +798,7 @@ class RLMAPF(MultiAgentEnv):
                     continue
                 
                 array = np.zeros(self.grid_size, dtype=float)
-                for agent2, path in self.d_star_paths.items():
+                for agent2, path in paths_for_obs.items():
                     if agent2 != agent:
                         for i, pos in enumerate(path):
                             if array[pos] == 0:
@@ -769,10 +811,10 @@ class RLMAPF(MultiAgentEnv):
                 array = self.crop_array(array, x, y, self.observation_size, pad_value=0)
                 
                 # Limit and normalize values vectorially
-                array[array > 10] = 10
+                array[array > 5] = 5
                 array = array.astype(np.float32)
                 mask = array != 0
-                array[mask] = 1.0 - (array[mask] - 1.0) / 10.0
+                array[mask] = 1.0 - (array[mask] - 1.0) / 5.0
                 
                 
                 others_d_star_path_arrays[agent] = array
@@ -786,9 +828,9 @@ class RLMAPF(MultiAgentEnv):
                 if self.use_d_star_lite:
                     grid = np.stack([
                         obstacles_array[agent].astype(np.float32),
-                        agents_positions_arrays[agent].astype(np.float32),
+                        # agents_positions_arrays[agent].astype(np.float32),
                         d_star_path_arrays[agent].astype(np.float32),
-                        # others_d_star_path_arrays[agent].astype(np.float32),
+                        others_d_star_path_arrays[agent].astype(np.float32),
                     ], axis=-1)
                 else:
                     grid = np.stack([
@@ -810,7 +852,7 @@ class RLMAPF(MultiAgentEnv):
                         **({'d_star_path': d_star_path_arrays[agent]} if self.use_d_star_lite else {}),
                         **({'d_star_path_others': others_d_star_path_arrays[agent]} if self.use_d_star_lite else {}), # Others' D* paths
                         'distance_to_goal': distance_to_goal[agent],
-                        'agents_positions': agents_positions_arrays[agent],
+                        # 'agents_positions': agents_positions_arrays[agent],
                         'obstacles': obstacles_array[agent]
                     }
                 else:
@@ -886,11 +928,12 @@ class RLMAPF(MultiAgentEnv):
             self._ax.add_patch(rect)
             self._patches.append(rect)
 
-        # Draw all D* Lite paths with per-agent styles
-        if self.use_d_star_lite and getattr(self, "d_star_paths", None):
+        # Draw all D* Lite paths with per-agent styles (static planned paths preferred)
+        paths_for_render = getattr(self, "d_star_paths", None) or getattr(self, "d_star_planned_paths", None)
+        if self.use_d_star_lite and paths_for_render:
             path_styles = getattr(self, "_path_styles", {})
-            for agent in sorted(self.d_star_paths.keys(), key=_agent_sort_key):
-                path = self.d_star_paths.get(agent, [])
+            for agent in sorted(paths_for_render.keys(), key=_agent_sort_key):
+                path = paths_for_render.get(agent, [])
                 if not path:
                     continue
                 style = path_styles.get(agent, {}) or {}
@@ -1009,6 +1052,103 @@ class RLMAPF(MultiAgentEnv):
         if clear:
             self._ax.cla()
 
+    def _maybe_capture_d_star_step_frame(self, is_reset: bool) -> None:
+        """
+        Capture the current D* Lite planner state into a GIF/PNG (debug only).
+        """
+        debug_cfg = self.config.get("d_star_debug", {})
+        if not debug_cfg.get("save_gif", False):
+            return
+        if not self.use_d_star_lite:
+            return
+        try:
+            import imageio
+            import matplotlib.pyplot as plt
+            from matplotlib.patches import Rectangle
+            from d_star_lite import OBSTACLE
+        except ImportError as exc:
+            print(f"[D* Lite debug] Skipping GIF capture (missing dependency): {exc}")
+            return
+
+        if not hasattr(self, "grid_size") or self.grid_size is None:
+            return
+
+        obstacle_grid = np.zeros(self.grid_size, dtype=np.uint8)
+        for pos in getattr(self, "obstacles", []):
+            obstacle_grid[pos] = OBSTACLE
+
+        traversal_costs = None
+        if hasattr(self, "d_star_maps") and self.d_star_maps:
+            some_map = next(iter(self.d_star_maps.values()))
+            traversal_costs = getattr(some_map, "traversal_costs", None)
+        if traversal_costs is None:
+            traversal_costs = np.ones(self.grid_size, dtype=np.float32)
+
+        agent_ids = sorted(self.agent_positions.keys())
+        paths_source = getattr(self, "d_star_paths", None) or getattr(self, "d_star_planned_paths", {})
+        paths = {agent: list(paths_source.get(agent, [])) for agent in agent_ids}
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        costs = traversal_costs.T
+        im = ax.imshow(costs, origin="lower", cmap="viridis", interpolation="none")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Traversal multiplier")
+
+        obstacle_positions = np.argwhere(obstacle_grid == OBSTACLE)
+        for ox, oy in obstacle_positions:
+            rect = Rectangle((ox - 0.5, oy - 0.5), 1.0, 1.0, facecolor="dimgray", edgecolor="black")
+            ax.add_patch(rect)
+
+        color_map = plt.colormaps.get_cmap("tab10")
+        for idx, agent in enumerate(agent_ids):
+            path = paths.get(agent, [])
+            color = color_map(idx % color_map.N)
+            if path:
+                xs = [cell[0] for cell in path]
+                ys = [cell[1] for cell in path]
+                ax.plot(xs, ys, "-o", color=color, linewidth=2, markersize=4, label=agent)
+
+            start = self.agent_positions.get(agent)
+            goal = self.goal_positions.get(agent)
+            if start is not None:
+                ax.scatter(start[0], start[1], marker="s", s=80, color=color, edgecolor="black")
+            if goal is not None:
+                ax.scatter(goal[0], goal[1], marker="*", s=120, color=color, edgecolor="black")
+
+        ax.set_title(f"Step {self.steps}{' (reset)' if is_reset else ''}")
+        ax.set_xlim(-0.5, self.grid_size[0] - 0.5)
+        ax.set_ylim(-0.5, self.grid_size[1] - 0.5)
+        ax.set_aspect("equal")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.legend(loc="upper right")
+        ax.grid(False)
+
+        fig.canvas.draw()
+        if hasattr(fig.canvas, "tostring_rgb"):
+            buf = fig.canvas.tostring_rgb()
+            w, h = fig.canvas.get_width_height()
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 3))
+        else:
+            rgba = np.asarray(fig.canvas.buffer_rgba())
+            frame = rgba[..., :3].copy()
+            h, w, _ = frame.shape
+
+        if self._dstar_gif_writer is None:
+            fps = max(1, int(debug_cfg.get("gif_fps", 5)))
+            gif_path = debug_cfg.get("gif_path", "dstar_debug.gif")
+            self._dstar_gif_writer = imageio.get_writer(gif_path, mode="I", duration=1.0 / fps)
+
+        self._dstar_gif_writer.append_data(frame)
+
+        if debug_cfg.get("save_pngs", False):
+            png_dir = Path(debug_cfg.get("png_dir", "dstar_debug_frames"))
+            png_dir.mkdir(parents=True, exist_ok=True)
+            png_path = png_dir / f"frame_{self._dstar_debug_frame_idx:05d}.png"
+            fig.savefig(png_path, dpi=200, bbox_inches="tight")
+
+        self._dstar_debug_frame_idx += 1
+        plt.close(fig)
+
     def _next_map_name(self) -> str:
         if not self.config["maps_names_with_variants"]:
             raise ValueError("No maps to load")
@@ -1100,6 +1240,18 @@ class RLMAPF(MultiAgentEnv):
             elif self.grid_size != grid_size:
                 raise ValueError("Map sizes do not match. Expected: {}, Found: {}, when processing {}".format(self.grid_size, grid_size, map_name))
 
+    def close(self):
+        if getattr(self, "_dstar_gif_writer", None) is not None:
+            try:
+                self._dstar_gif_writer.close()
+            except Exception:
+                pass
+            self._dstar_gif_writer = None
+        try:
+            super().close()
+        except Exception:
+            pass
+
 
 def _calculate_overlap_percentages(
     paths: Dict[str, List[Tuple[int, int]]]
@@ -1144,7 +1296,7 @@ def _debug_print_d_star_paths(env: RLMAPF, label: str) -> None:
         print(f"[D* Lite debug] {label}: D* Lite disabled; skipping path print.")
         return
 
-    paths = getattr(env, "d_star_paths", None) or {}
+    paths = getattr(env, "d_star_paths", None) or getattr(env, "d_star_planned_paths", None) or {}
     if not paths:
         print(f"[D* Lite debug] {label}: no D* Lite paths available.")
         return
@@ -1294,7 +1446,7 @@ def _visualize_env_planner_state(
     history = [
         {
             "iteration": 1,
-            "paths": {agent: list(path) for agent, path in getattr(env, "d_star_paths", {}).items()},
+            "paths": {agent: list(path) for agent, path in (getattr(env, "d_star_paths", None) or getattr(env, "d_star_planned_paths", {})).items()},
             "traversal_costs": traversal_costs.copy(),
         }
     ]
@@ -1321,7 +1473,7 @@ if __name__ == "__main__":
     env_config = {
         "agents_num": 10,
         "render_mode": "human",
-        "max_steps": 10,
+        "max_steps": 250,
         "observation_type": "array",
         "maps_names_with_variants": {
             # "warehouse0_1-10a-21x21": None,
@@ -1345,6 +1497,13 @@ if __name__ == "__main__":
             "save_frames": True,
             "frames_path": "frames/",
         },
+        "d_star_debug": {
+            "save_gif": True,
+            "gif_path": "dstar_debug.gif",
+            "gif_fps": 5,
+            "save_pngs": False,
+            "png_dir": "dstar_debug_frames",
+        },
         # "seed": 42,
     }
 
@@ -1362,7 +1521,7 @@ if __name__ == "__main__":
 
     for i in range(1):
         obs, _ = env.reset()
-        _debug_print_d_star_paths(env, label=f"Initial D* Lite plan (episode {i})")
+        # _debug_print_d_star_paths(env, label=f"Initial D* Lite plan (episode {i})")
         _visualize_env_planner_state(env, save_dir="dstar_env", display=False)
         _visualize_d_star_iterations(env, save_dir="dstar", pause_seconds=0.5, display=False)
         total_rewards = {agent: 0 for agent in env.get_agent_ids()}
@@ -1391,3 +1550,5 @@ if __name__ == "__main__":
         pbar.close()
 
         print("Episode {} finished! Rewards:".format(i), total_rewards)
+
+    env.close()

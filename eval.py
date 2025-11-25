@@ -9,9 +9,10 @@ import os
 import subprocess
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set, Union
 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
@@ -19,6 +20,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import ray
+try:  # Ray versions prior to 2.7 don't expose this symbol
+    from ray._private.utils import RayDeprecationWarning  # type: ignore
+except ImportError:  # pragma: no cover - fallback for older Ray releases
+    class RayDeprecationWarning(DeprecationWarning):
+        pass
 import yaml
 from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.algorithms.ppo import PPOConfig
@@ -27,6 +33,16 @@ from rlmapf2 import RLMAPF
 
 # Ignore deprecation warnings
 os.environ["PYTHONWARNINGS"] = "ignore::DeprecationWarning"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=RayDeprecationWarning)
+
+ACTION_DELTAS = {
+    0: (0, -1),  # Up
+    1: (0, 1),   # Down
+    2: (-1, 0),  # Left
+    3: (1, 0),   # Right
+    4: (0, 0),   # Wait
+}
 
 LOG_LEVEL = logging.INFO
 logger = logging.getLogger("eval")
@@ -87,9 +103,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--video-agents",
-        type=int,
+        type=str,
         default=None,
-        help="Specific agent count to render video for (renders only this count).",
+        help="Comma-separated list or ranges of agent counts to render (e.g. '8,16,32-36').",
     )
     return parser.parse_args(argv)
 
@@ -161,7 +177,39 @@ def parse_agent_range(range_str: str) -> range:
     raise ValueError(f"Invalid agent range format: {range_str}")
 
 
-def resolve_checkpoint_path(checkpoint_arg: str, experiments_root: str = "experiments") -> str:
+def parse_video_agent_selection(selection: Optional[str]) -> Optional[Set[int]]:
+    """Parse comma-separated agent counts/ranges for video rendering."""
+    if selection is None:
+        return None
+
+    selected: Set[int] = set()
+    for part in selection.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            try:
+                start_str, end_str = part.split('-', 1)
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError as exc:
+                raise ValueError(f"Invalid video agent range: '{part}'") from exc
+            if start > end:
+                raise ValueError(f"Video agent range start > end in '{part}'")
+            selected.update(range(start, end + 1))
+        else:
+            try:
+                selected.add(int(part))
+            except ValueError as exc:
+                raise ValueError(f"Invalid agent count '{part}' in --video-agents") from exc
+
+    if not selected:
+        raise ValueError("--video-agents did not include any valid agent counts")
+    return selected
+
+
+def resolve_checkpoint_path(checkpoint_arg: str,
+                            experiments_roots: Union[str, Path, Iterable[Union[str, Path]]] = "experiments") -> str:
     """
     Resolve checkpoint argument to full path.
 
@@ -171,7 +219,7 @@ def resolve_checkpoint_path(checkpoint_arg: str, experiments_root: str = "experi
 
     Args:
         checkpoint_arg: Either a number or a full checkpoint path
-        experiments_root: Root directory to search for checkpoints
+        experiments_roots: One or more root directories to search for checkpoints
 
     Returns:
         Full path to checkpoint directory
@@ -180,28 +228,40 @@ def resolve_checkpoint_path(checkpoint_arg: str, experiments_root: str = "experi
     if checkpoint_arg.isdigit():
         n = int(checkpoint_arg)
 
-        # Find all checkpoint directories
-        experiments_path = Path(experiments_root)
-        if not experiments_path.exists():
-            raise FileNotFoundError(f"Experiments directory not found: {experiments_root}")
+        if isinstance(experiments_roots, (str, Path)):
+            roots: List[Union[str, Path]] = [experiments_roots]
+        else:
+            roots = list(experiments_roots)
+        if not roots:
+            roots = ["experiments"]
 
-        # Look for checkpoint folders
-        checkpoint_dirs = []
-        for exp_dir in experiments_path.glob("*/checkpoints"):
-            for ckpt_dir in exp_dir.iterdir():
-                if ckpt_dir.is_dir() and (ckpt_dir / "algorithm_state.pkl").exists():
-                    checkpoint_dirs.append(ckpt_dir)
+        checkpoint_dirs: List[Path] = []
+        for experiments_root in roots:
+            experiments_path = Path(experiments_root)
+            if not experiments_path.exists():
+                continue
+            for ckpt_state in experiments_path.rglob("algorithm_state.pkl"):
+                checkpoint_dirs.append(ckpt_state.parent)
 
         if not checkpoint_dirs:
-            raise FileNotFoundError(f"No checkpoints found in {experiments_root}")
+            raise FileNotFoundError(
+                "No checkpoints found in any search roots: " + ", ".join(str(r) for r in roots)
+            )
 
-        # Sort by modification time (most recent first)
-        checkpoint_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        # Remove duplicates and sort by modification time (most recent first)
+        unique_dirs = []
+        seen = set()
+        for path in checkpoint_dirs:
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                unique_dirs.append(path)
+        unique_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
-        if n > len(checkpoint_dirs):
-            raise ValueError(f"Requested checkpoint #{n} but only {len(checkpoint_dirs)} checkpoints found")
+        if n > len(unique_dirs):
+            raise ValueError(f"Requested checkpoint #{n} but only {len(unique_dirs)} checkpoints found")
 
-        selected_checkpoint = checkpoint_dirs[n - 1]
+        selected_checkpoint = unique_dirs[n - 1]
         logger.info(f"Checkpoint #{n} resolved to: {selected_checkpoint}")
         return str(selected_checkpoint)
 
@@ -309,7 +369,7 @@ def configure_env(config: Dict[str, Any], agents_num: Optional[int] = None,
             "title": f"RLMAPF Evaluation - {agents_num} agents" + (" (D*)" if env_config.get('use_d_star_lite', False) else ""),
             "save_frames": False,
             "frames_path": "frames/",
-            "smooth_motion": config.get('eval_smooth_motion', True),
+            "smooth_motion": config.get('eval_smooth_motion', False),
             "motion_frames": config.get('eval_motion_frames', 5),
         },
     }
@@ -350,15 +410,18 @@ def plot_metric_distributions(detailed_results_path: Path, plots_dir: Path):
     try:
         df = pd.read_csv(detailed_results_path)
         metrics_to_plot = [
-            ('episode_length', 'Episode Length'),
-            ('reward', 'Total Reward'),
-            ('collisions', 'Total Collisions'),
-            ('throughput', 'Throughput (steps/s)'),
-            ('path_efficiency', 'Path Efficiency'),
+            ('episode_length_steps', 'Episode Length (steps)'),
+            ('total_reward', 'Total Reward'),
+            ('total_collisions', 'Total Collisions'),
+            ('throughput_steps_per_sec', 'Throughput (steps/s)'),
+            ('collision_agent_agent', 'Agent-Agent Collisions'),
             ('wait_actions', 'Wait Actions'),
-            ('goal_completion_rate', 'Goal Completion Rate (%)')
+            ('goal_completion_rate_percent', 'Goal Completion Rate (%)'),
+            ('completion_step_deviation', 'Completion Step Deviation')
         ]
-        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        rows = 2
+        cols = 4
+        fig, axes = plt.subplots(rows, cols, figsize=(20, 10))
         axes = axes.flatten()
         for idx, (metric, title) in enumerate(metrics_to_plot):
             if metric in df.columns:
@@ -369,7 +432,8 @@ def plot_metric_distributions(detailed_results_path: Path, plots_dir: Path):
                 axes[idx].set_xlabel('Number of Agents')
                 axes[idx].set_ylabel(title)
                 axes[idx].grid(True, alpha=0.3)
-        axes[-1].set_visible(False)
+        for extra_ax in axes[len(metrics_to_plot):]:
+            extra_ax.set_visible(False)
         plt.tight_layout()
         plt.savefig(plots_dir / 'metric_distributions.png', dpi=300, bbox_inches='tight')
         plt.close()
@@ -407,10 +471,10 @@ def plot_success_rate_heatmap(detailed_results_path: Path, plots_dir: Path):
     """Generate 2D heatmap of goal completion rates."""
     try:
         df = pd.read_csv(detailed_results_path)
-        if 'goal_completion_rate' not in df.columns:
-            logger.warning("goal_completion_rate column not found")
+        if 'goal_completion_rate_percent' not in df.columns:
+            logger.warning("goal_completion_rate_percent column not found")
             return
-        pivot = df.pivot_table(values='goal_completion_rate', index='repeat', columns='agents_num', aggfunc='mean')
+        pivot = df.pivot_table(values='goal_completion_rate_percent', index='repeat', columns='agents_num', aggfunc='mean')
         fig, ax = plt.subplots(figsize=(14, 8))
         im = ax.imshow(pivot.values, cmap='RdYlGn', aspect='auto', vmin=0, vmax=100)
         ax.set_xticks(np.arange(len(pivot.columns)))
@@ -427,7 +491,7 @@ def plot_success_rate_heatmap(detailed_results_path: Path, plots_dir: Path):
                 value = pivot.values[i, j]
                 if not np.isnan(value):
                     ax.text(j, i, f'{value:.0f}', ha='center', va='center',
-                            color='black' if value > 50 else 'white', fontsize=8)
+                            color='black', fontsize=8)
         plt.tight_layout()
         plt.savefig(plots_dir / 'success_rate_heatmap.png', dpi=300, bbox_inches='tight')
         plt.close()
@@ -441,12 +505,16 @@ def plot_temporal_progression(detailed_results_path: Path, plots_dir: Path):
     try:
         df = pd.read_csv(detailed_results_path)
         metrics_to_plot = [
-            ('episode_length', 'Episode Length (steps)'),
-            ('collisions', 'Total Collisions'),
-            ('throughput', 'Throughput (steps/s)'),
-            ('path_efficiency', 'Path Efficiency')
+            ('episode_length_steps', 'Episode Length (steps)'),
+            ('total_collisions', 'Total Collisions'),
+            ('collision_agent_agent', 'Agent-Agent Collisions'),
+            ('total_reward', 'Total Reward'),
+            ('goal_completion_rate_percent', 'Goal Completion Rate (%)'),
+            ('completion_step_deviation', 'Completion Step Deviation')
         ]
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        rows = 3
+        cols = 2
+        fig, axes = plt.subplots(rows, cols, figsize=(18, 18))
         axes = axes.flatten()
         for idx, (metric, title) in enumerate(metrics_to_plot):
             if metric in df.columns:
@@ -478,12 +546,13 @@ def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
             logger.warning("Need at least 2 maps for cross-map comparison")
             return
         metrics = [
-            ('avg_length', 'Average Episode Length'),
-            ('avg_collisions', 'Average Collisions'),
-            ('avg_throughput', 'Average Throughput (steps/s)'),
-            ('avg_goal_completion_rate', 'Goal Completion Rate (%)'),
-            ('avg_efficiency', 'Path Efficiency'),
-            ('success_rate', 'Success Rate (%)')
+            ('avg_length_steps', 'Average Episode Length (steps)'),
+            ('avg_total_collisions', 'Average Collisions'),
+            ('avg_collision_agent_agent', 'Agent-Agent Collisions'),
+            ('avg_throughput_steps_per_sec', 'Average Throughput (steps/s)'),
+            ('avg_goal_completion_rate_percent', 'Goal Completion Rate (%)'),
+            ('avg_reward', 'Average Reward'),
+            ('success_rate_percent', 'Success Rate (%)')
         ]
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         axes = axes.flatten()
@@ -534,6 +603,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     args = parse_args(argv)
     repo_root = Path(__file__).resolve().parent
+    try:
+        video_agent_selection = parse_video_agent_selection(args.video_agents)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return 1
     
     # Load and resolve config
     config_path = resolve_config_path(args.config, args.config_dir, repo_root)
@@ -554,8 +628,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     NUM_GPUS = hardware_config.get('num_gpus', 0)
 
     # Resolve and convert checkpoint path to absolute path
-    experiments_root = config.get('paths', {}).get('experiments_root', 'experiments')
-    resolved_checkpoint = resolve_checkpoint_path(args.checkpoint, experiments_root)
+    paths_config = config.get('paths', {})
+    experiments_root = paths_config.get('experiments_root')
+    train_experiments_root = paths_config.get('train_experiments_root', 'experiments/train')
+
+    checkpoint_search_roots: List[Union[str, Path]] = []
+    if experiments_root:
+        checkpoint_search_roots.append(experiments_root)
+    if train_experiments_root and all(Path(train_experiments_root) != Path(existing)
+                                     for existing in checkpoint_search_roots):
+        checkpoint_search_roots.append(train_experiments_root)
+    # Always include generic fallback to maintain backwards compatibility
+    if all(Path('experiments') != Path(existing) for existing in checkpoint_search_roots):
+        checkpoint_search_roots.append('experiments')
+
+    resolved_checkpoint = resolve_checkpoint_path(args.checkpoint, checkpoint_search_roots)
     CHECKPOINT_PATH = os.path.abspath(resolved_checkpoint)
     
     # Parse evaluation parameters
@@ -567,7 +654,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     # Video rendering settings
     RENDER_VIDEO = args.render_video
-    VIDEO_AGENTS = args.video_agents  # If set, only render video for this agent count
+    VIDEO_AGENTS = video_agent_selection  # If set, only render for specific agent counts
     
     # If rendering video, only do 1 repeat (to save time) unless specified otherwise
     if RENDER_VIDEO and args.repeats is None:
@@ -580,8 +667,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.results_dir:
         results_dir = Path(args.results_dir).resolve()
     else:
-        results_base = config.get('paths', {}).get('experiments_root', 'experiments')
-        results_dir = (Path(results_base) / run_name).resolve()
+        results_base = Path(config.get('paths', {}).get('experiments_root', 'experiments'))
+        name_prefix = config.get('run', {}).get('name_prefix')
+        if name_prefix:
+            results_dir = (results_base / name_prefix / run_name).resolve()
+        else:
+            results_dir = (results_base / run_name).resolve()
     
     results_dir.mkdir(parents=True, exist_ok=True)
     
@@ -602,7 +693,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("CPUs: %d, GPUs: %d", NUM_CPUS, NUM_GPUS)
     if RENDER_VIDEO:
         if VIDEO_AGENTS:
-            logger.info("Video rendering: ENABLED (only for %d agents)", VIDEO_AGENTS)
+            selection_str = ", ".join(str(num) for num in sorted(VIDEO_AGENTS))
+            logger.info("Video rendering: ENABLED (only for agents: %s)", selection_str)
         else:
             logger.info("Video rendering: ENABLED (for all agent counts)")
     else:
@@ -675,12 +767,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 current_results_dir = results_dir
         
-            # Build and restore the algorithm
-            logger.info("Building algorithm and loading checkpoint...")
-            algorithm = algorithm_config_builder.build()
-            algorithm.restore(CHECKPOINT_PATH)
-            logger.info("Checkpoint loaded successfully!")
-        
             # Setup results tracking
             time_results = {}
             lengths_results = {}
@@ -689,10 +775,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             collision_agent_agent_results = {}
             collision_agent_obstacle_results = {}
             throughput_results = {}
-            efficiency_results = {}
             wait_actions_results = {}
             goal_completion_rate_results = {}
             avg_steps_to_goal_results = {}
+            completion_deviation_results = {}
             deadlocks = {}
         
             def run_repeat(agents_num: int, repeat: int) -> tuple:
@@ -700,7 +786,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 logger.info("Evaluating with %d agents, repeat %d/%d", agents_num, repeat + 1, REPEATS)
             
                 # Check if we should render video for this agent count
-                should_render = RENDER_VIDEO and (VIDEO_AGENTS is None or VIDEO_AGENTS == agents_num)
+                should_render = RENDER_VIDEO and (VIDEO_AGENTS is None or agents_num in VIDEO_AGENTS)
             
                 # Setup video path if rendering
                 video_path = None
@@ -728,37 +814,39 @@ def main(argv: Optional[List[str]] = None) -> int:
                     temp_algorithm = algorithm_config_builder.build()
                     temp_algorithm.restore(CHECKPOINT_PATH)
                     policy = temp_algorithm.get_policy()
-                
-                    # Run episode manually
-                    start_time = time.time()
-                    obs, info = env.reset()
-                    done = False
-                    step_count = 0
-                    max_steps = env_config_dict['max_steps']
-                
-                    while not done and step_count < max_steps:
-                        # Get actions from policy
-                        actions = {}
-                        for agent_id, agent_obs in obs.items():
-                            action = policy.compute_single_action(agent_obs)[0]
-                            actions[agent_id] = action
-                    
-                        # Step environment (render() called automatically inside step())
-                        obs, rewards, dones, truncated, info = env.step(actions)
-                        step_count += 1
-                        done = all(dones.values()) or all(truncated.values())
-                
-                    # CRITICAL: Finalize video to save it
-                    env.finalize_video()
-                    env.close()
-                
-                    elapsed_time = time.time() - start_time
-                    episode_len = step_count
-                
-                    # Cleanup temporary algorithm
-                    del temp_algorithm
-                
-                    logger.info("Video saved to: %s", video_path)
+
+                    try:
+                        # Run episode manually
+                        start_time = time.time()
+                        obs, info = env.reset()
+                        done = False
+                        step_count = 0
+                        max_steps = env_config_dict['max_steps']
+
+                        while not done and step_count < max_steps:
+                            # Get actions from policy
+                            actions = {}
+                            for agent_id, agent_obs in obs.items():
+                                action = policy.compute_single_action(agent_obs)[0]
+                                actions[agent_id] = action
+                        
+                            # Step environment (render() called automatically inside step())
+                            obs, rewards, dones, truncated, info = env.step(actions)
+                            step_count += 1
+                            done = all(dones.values()) or all(truncated.values())
+
+                        # CRITICAL: Finalize video to save it
+                        env.finalize_video()
+                        env.close()
+
+                        elapsed_time = time.time() - start_time
+                        episode_len = step_count
+
+                        logger.info("Video saved to: %s", video_path)
+                    finally:
+                        # Cleanup temporary algorithm
+                        temp_algorithm.stop()
+                        del temp_algorithm
                 else:
                     # Normal evaluation without video using RLlib's evaluate()
                     eval_config = algorithm_config_builder.environment(
@@ -783,6 +871,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     except Exception as e:
                         logger.error("Error during evaluation: %s", e)
                         return (agents_num, repeat, None, None, None, None, None, None, None, None, None, None, None)
+                    finally:
+                        eval_algorithm.stop()
             
                 # Check for deadlock
                 max_steps = env_config.get('max_steps', 250)
@@ -806,80 +896,136 @@ def main(argv: Optional[List[str]] = None) -> int:
                 temp_algorithm.restore(CHECKPOINT_PATH)
                 policy = temp_algorithm.get_policy()
 
-                start_time = time.time()
-                obs, info = env.reset()
-                done = False
-                step_count = 0
-                max_steps = env_config_dict['max_steps']
+                try:
+                    start_time = time.time()
+                    obs, info = env.reset()
+                    done = False
+                    step_count = 0
+                    max_steps = env_config_dict['max_steps']
 
-                actions_history = []
-                agents_reached_goal = set()
-                agent_completion_steps = {}
-                total_reward = 0.0
-                total_agent_obstacle_collisions = 0
-                prev_positions = {}
-                total_agents = len(env.agents) if hasattr(env, 'agents') else agents_num
+                    actions_history = []
+                    agents_reached_goal = set()
+                    agent_completion_steps = {}
+                    total_reward = 0.0
+                    agent_agent_collision_total = 0
+                    agent_obstacle_collision_total = 0
+                    prev_positions = {}
+                    total_agents = len(env.agents) if hasattr(env, 'agents') else agents_num
+                    collision_counters = {
+                        agent_id: info.get(agent_id, {}).get("number_of_collisions", 0)
+                        for agent_id in obs.keys()
+                    }
 
-                while not done and step_count < max_steps:
-                    if hasattr(env, 'agent_positions'):
-                        prev_positions = {agent_id: env.agent_positions[agent_id].copy()
-                                         if hasattr(env.agent_positions[agent_id], 'copy')
-                                         else tuple(env.agent_positions[agent_id])
-                                         for agent_id in obs.keys()}
+                    while not done and step_count < max_steps:
+                        if hasattr(env, 'agent_positions'):
+                            prev_positions = {
+                                agent_id: env.agent_positions[agent_id].copy()
+                                if hasattr(env.agent_positions[agent_id], 'copy')
+                                else tuple(env.agent_positions[agent_id])
+                                for agent_id in obs.keys()
+                            }
 
-                    actions = {}
-                    for agent_id, agent_obs in obs.items():
-                        action = policy.compute_single_action(agent_obs)[0]
-                        actions[agent_id] = action
+                        actions = {}
+                        intended_positions = {}
+                        for agent_id, agent_obs in obs.items():
+                            action = policy.compute_single_action(agent_obs)[0]
+                            actions[agent_id] = action
+                            delta = ACTION_DELTAS.get(action, (0, 0))
+                            prev = prev_positions.get(agent_id, (0, 0))
+                            intended_positions[agent_id] = (prev[0] + delta[0], prev[1] + delta[1])
 
-                    actions_history.append(actions.copy())
-                    obs, rewards, dones, truncated, info = env.step(actions)
-                    total_reward += sum(rewards.values())
+                        actions_history.append(actions.copy())
+                        obs, rewards, dones, truncated, info = env.step(actions)
+                        total_reward += sum(rewards.values())
 
-                    for agent_id, is_done in dones.items():
-                        if is_done and agent_id not in agents_reached_goal:
-                            agents_reached_goal.add(agent_id)
-                            agent_completion_steps[agent_id] = step_count
+                        for agent_id, is_done in dones.items():
+                            if is_done and agent_id not in agents_reached_goal:
+                                agents_reached_goal.add(agent_id)
+                                agent_completion_steps[agent_id] = step_count
 
-                    if hasattr(env, 'agent_positions') and prev_positions:
-                        for agent_id in prev_positions.keys():
-                            if agent_id in info and hasattr(env, 'agent_positions'):
-                                current_pos = env.agent_positions.get(agent_id)
-                                if current_pos is not None:
-                                    prev_pos = prev_positions[agent_id]
-                                    if prev_pos == current_pos or tuple(prev_pos) == tuple(current_pos):
-                                        if agent_id in actions_history[-1] and actions_history[-1][agent_id] != 4:
-                                            total_agent_obstacle_collisions += 1
+                        collision_deltas = {}
+                        for agent_id in collision_counters.keys():
+                            new_count = info.get(agent_id, {}).get("number_of_collisions", collision_counters[agent_id])
+                            delta = new_count - collision_counters[agent_id]
+                            if delta > 0:
+                                collision_deltas[agent_id] = delta
+                            collision_counters[agent_id] = new_count
 
-                    step_count += 1
-                    done = all(dones.values()) or all(truncated.values())
+                        if collision_deltas:
+                            for agent_id, delta in collision_deltas.items():
+                                is_agent_collision = False
+                                for other_id in collision_deltas.keys():
+                                    if other_id == agent_id:
+                                        continue
+                                    if intended_positions.get(agent_id) == intended_positions.get(other_id):
+                                        is_agent_collision = True
+                                        break
+                                    if (
+                                        intended_positions.get(agent_id) == prev_positions.get(other_id)
+                                        and intended_positions.get(other_id) == prev_positions.get(agent_id)
+                                    ):
+                                        is_agent_collision = True
+                                        break
+                                    if (
+                                        intended_positions.get(agent_id) == prev_positions.get(other_id)
+                                        and actions.get(other_id, 4) == 4
+                                    ):
+                                        is_agent_collision = True
+                                        break
+                                if is_agent_collision:
+                                    agent_agent_collision_total += delta
+                                else:
+                                    agent_obstacle_collision_total += delta
 
-                if should_render:
-                    env.finalize_video()
-                    logger.info("Video saved to: %s", video_path)
+                        step_count += 1
+                        done = all(dones.values()) or all(truncated.values())
 
-                env.close()
-                elapsed_time = time.time() - start_time
-                del temp_algorithm
+                    if should_render:
+                        env.finalize_video()
+                        logger.info("Video saved to: %s", video_path)
+
+                    env.close()
+                    elapsed_time = time.time() - start_time
+                finally:
+                    temp_algorithm.stop()
+                    del temp_algorithm
 
                 episode_len = step_count
                 wait_actions = sum(1 for action_set in actions_history for action in action_set.values() if action == 4)
                 goal_completion_rate = (len(agents_reached_goal) / total_agents * 100) if total_agents > 0 else 0
-                avg_steps_to_goal = sum(agent_completion_steps.values()) / len(agent_completion_steps) if agent_completion_steps else np.nan
-                total_collisions = total_agent_obstacle_collisions
-                collision_agent_agent = 0
-                collision_agent_obstacle = total_agent_obstacle_collisions
+                avg_steps_to_goal = (
+                    sum(agent_completion_steps.values()) / len(agent_completion_steps)
+                    if agent_completion_steps
+                    else np.nan
+                )
+                total_collisions = agent_agent_collision_total + agent_obstacle_collision_total
+                collision_agent_agent = agent_agent_collision_total
+                collision_agent_obstacle = agent_obstacle_collision_total
                 throughput = episode_len / elapsed_time if elapsed_time > 0 else 0
-                path_efficiency = 1.0
+                if agent_completion_steps:
+                    mean_completion = float(np.mean(list(agent_completion_steps.values())))
+                    completion_deviation = float(np.mean([abs(v - mean_completion) for v in agent_completion_steps.values()]))
+                else:
+                    completion_deviation = np.nan
 
-                logger.info("Completed in %.4fs | steps=%d | reward=%.2f | collisions=%d (aa=%d, ao=%d) | wait=%d | goal_rate=%.1f%% | throughput=%.2f/s | eff=%.3f",
-                           elapsed_time, episode_len, total_reward, total_collisions,
-                           collision_agent_agent, collision_agent_obstacle,
-                           wait_actions, goal_completion_rate, throughput, path_efficiency)
+                logger.info(
+                    "Completed in %.4f s | steps=%d | reward=%.2f | collisions=%d "
+                    "(agent-agent=%d, agent-obstacle=%d) | wait actions=%d | "
+                    "goal_rate=%.1f%% | throughput=%.2f steps/s",
+                    elapsed_time,
+                    episode_len,
+                    total_reward,
+                    total_collisions,
+                    collision_agent_agent,
+                    collision_agent_obstacle,
+                    wait_actions,
+                    goal_completion_rate,
+                    throughput,
+                )
 
                 return (agents_num, repeat, elapsed_time, episode_len, total_reward,
                        total_collisions, collision_agent_agent, collision_agent_obstacle,
-                       throughput, path_efficiency, wait_actions, goal_completion_rate, avg_steps_to_goal)
+                       throughput, wait_actions, goal_completion_rate, avg_steps_to_goal, completion_deviation)
         
             # Run evaluations for each agent count
             for agents_num in AGENTS_RANGE:
@@ -896,7 +1042,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     for future in as_completed(futures):
                         (agents_num_r, repeat_r, elapsed_time, episode_len, reward,
                          collisions, collision_aa, collision_ao,
-                         throughput, efficiency, wait_acts, goal_rate, avg_steps) = future.result()
+                         throughput, wait_acts, goal_rate, avg_steps, completion_dev) = future.result()
 
                         # Save all results
                         time_results[(agents_num_r, repeat_r)] = elapsed_time
@@ -906,10 +1052,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         collision_agent_agent_results[(agents_num_r, repeat_r)] = collision_aa
                         collision_agent_obstacle_results[(agents_num_r, repeat_r)] = collision_ao
                         throughput_results[(agents_num_r, repeat_r)] = throughput
-                        efficiency_results[(agents_num_r, repeat_r)] = efficiency
                         wait_actions_results[(agents_num_r, repeat_r)] = wait_acts
                         goal_completion_rate_results[(agents_num_r, repeat_r)] = goal_rate
                         avg_steps_to_goal_results[(agents_num_r, repeat_r)] = avg_steps
+                        completion_deviation_results[(agents_num_r, repeat_r)] = completion_dev
 
                         max_steps = env_config.get('max_steps', 250)
                         deadlock = 0 if episode_len < max_steps else 1
@@ -925,8 +1071,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 
                     logger.info("")
                     logger.info("Results for %d agents:", agents_num)
-                    logger.info("  Average time: %.5f seconds", avg_time)
-                    logger.info("  Average length: %.2f steps", avg_length)
+                    logger.info("  Average episode time: %.5f s", avg_time)
+                    logger.info("  Average episode length: %.2f steps", avg_length)
                     logger.info("  Deadlocks: %d/%d", deadlocks[agents_num], REPEATS)
                 
                     # Save intermediate results
@@ -934,13 +1080,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 
                     with open(str(intermediate_name) + '.txt', 'w') as f:
                         f.write(f"Results for {agents_num} agents:\n")
-                        f.write(f"Average time: {avg_time:.5f} seconds\n")
-                        f.write(f"Average length: {avg_length:.2f} steps\n")
+                        f.write(f"Average episode time: {avg_time:.5f} seconds\n")
+                        f.write(f"Average episode length: {avg_length:.2f} steps\n")
                         f.write(f"Deadlocks: {deadlocks[agents_num]}/{REPEATS}\n")
                         f.write("\nDetailed results:\n")
                         for (agents_num_r, repeat), elapsed_time in sorted(agent_time_results):
                             episode_len = lengths_results[(agents_num_r, repeat)]
-                            f.write(f"Repeat {repeat}: Time={elapsed_time:.5f}s, Length={episode_len:.2f}\n")
+                            f.write(f"Repeat {repeat}: Time={elapsed_time:.5f}s, Length={episode_len:.2f} steps\n")
                 
                     # Save intermediate CSV
                     df_data = []
@@ -948,17 +1094,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                         df_data.append({
                             'agents_num': agents_num_r,
                             'repeat': repeat,
-                            'elapsed_time': elapsed_time,
-                            'episode_length': lengths_results[(agents_num_r, repeat)],
-                            'reward': rewards_results[(agents_num_r, repeat)],
-                            'collisions': collisions_results[(agents_num_r, repeat)],
+                            'episode_runtime_seconds': elapsed_time,
+                            'episode_length_steps': lengths_results[(agents_num_r, repeat)],
+                            'total_reward': rewards_results[(agents_num_r, repeat)],
+                            'total_collisions': collisions_results[(agents_num_r, repeat)],
                             'collision_agent_agent': collision_agent_agent_results[(agents_num_r, repeat)],
                             'collision_agent_obstacle': collision_agent_obstacle_results[(agents_num_r, repeat)],
-                            'throughput': throughput_results[(agents_num_r, repeat)],
-                            'path_efficiency': efficiency_results[(agents_num_r, repeat)],
+                            'throughput_steps_per_sec': throughput_results[(agents_num_r, repeat)],
                             'wait_actions': wait_actions_results[(agents_num_r, repeat)],
-                            'goal_completion_rate': goal_completion_rate_results[(agents_num_r, repeat)],
-                            'avg_steps_to_goal': avg_steps_to_goal_results[(agents_num_r, repeat)]
+                            'goal_completion_rate_percent': goal_completion_rate_results[(agents_num_r, repeat)],
+                            'average_steps_to_goal': avg_steps_to_goal_results[(agents_num_r, repeat)],
+                            'completion_step_deviation': completion_deviation_results[(agents_num_r, repeat)]
                         })
 
                     df = pd.DataFrame(df_data)
@@ -982,28 +1128,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                     avg_collision_aa = np.nanmean([collision_agent_agent_results[(agents_num, r)] for r in range(REPEATS)])
                     avg_collision_ao = np.nanmean([collision_agent_obstacle_results[(agents_num, r)] for r in range(REPEATS)])
                     avg_throughput = np.nanmean([throughput_results[(agents_num, r)] for r in range(REPEATS)])
-                    avg_efficiency = np.nanmean([efficiency_results[(agents_num, r)] for r in range(REPEATS)])
                     avg_wait_actions = np.nanmean([wait_actions_results[(agents_num, r)] for r in range(REPEATS)])
                     avg_goal_rate = np.nanmean([goal_completion_rate_results[(agents_num, r)] for r in range(REPEATS)])
+                    avg_completion_deviation = np.nanmean([
+                        completion_deviation_results[(agents_num, r)] for r in range(REPEATS)
+                    ])
 
                     summary_data.append({
                         'agents_num': agents_num,
-                        'avg_time': avg_time,
-                        'avg_length': avg_length,
+                        'avg_time_seconds': avg_time,
+                        'avg_length_steps': avg_length,
                         'avg_reward': avg_reward,
-                        'avg_collisions': avg_collisions,
+                        'avg_total_collisions': avg_collisions,
                         'avg_collision_agent_agent': avg_collision_aa,
                         'avg_collision_agent_obstacle': avg_collision_ao,
-                        'avg_throughput': avg_throughput,
-                        'avg_efficiency': avg_efficiency,
+                        'avg_throughput_steps_per_sec': avg_throughput,
                         'avg_wait_actions': avg_wait_actions,
-                        'avg_goal_completion_rate': avg_goal_rate,
+                        'avg_goal_completion_rate_percent': avg_goal_rate,
+                        'avg_completion_step_deviation': avg_completion_deviation,
                         'deadlocks': deadlocks[agents_num],
                         'total_runs': REPEATS,
-                        'success_rate': (REPEATS - deadlocks[agents_num]) / REPEATS * 100
+                        'success_rate_percent': (REPEATS - deadlocks[agents_num]) / REPEATS * 100
                     })
                 
-                    logger.info("Agents: %2d | Time: %7.5fs | Length: %6.2f | Deadlocks: %d/%d (%.1f%% success)",
+                    logger.info("Agents: %2d | Time: %7.5fs | Length: %6.2f steps | Deadlocks: %d/%d (%.1f%% success)",
                               agents_num, avg_time, avg_length, deadlocks[agents_num], REPEATS,
                               (REPEATS - deadlocks[agents_num]) / REPEATS * 100)
         
@@ -1016,10 +1164,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f.write("=" * 80 + "\n\n")
                 for item in summary_data:
                     f.write(f"Agents: {item['agents_num']:2d} | ")
-                    f.write(f"Time: {item['avg_time']:7.5f}s | ")
-                    f.write(f"Length: {item['avg_length']:6.2f} | ")
+                    f.write(f"Time: {item['avg_time_seconds']:7.5f}s | ")
+                    f.write(f"Length: {item['avg_length_steps']:6.2f} steps | ")
                     f.write(f"Deadlocks: {item['deadlocks']}/{item['total_runs']} ")
-                    f.write(f"({item['success_rate']:.1f}% success)\n")
+                    f.write(f"({item['success_rate_percent']:.1f}% success)\n")
             
                 f.write("\n" + "=" * 80 + "\n")
                 f.write("Detailed Results\n")
@@ -1027,7 +1175,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for (agents_num, repeat), elapsed_time in sorted(time_results.items()):
                     episode_len = lengths_results[(agents_num, repeat)]
                     f.write(f"Agents: {agents_num}, Repeat: {repeat}, ")
-                    f.write(f"Time: {elapsed_time:.5f}s, Length: {episode_len:.2f}\n")
+                    f.write(f"Time: {elapsed_time:.5f}s, Length: {episode_len:.2f} steps\n")
         
             # Save final CSV with all data
             df_data = []
@@ -1035,17 +1183,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 df_data.append({
                     'agents_num': agents_num,
                     'repeat': repeat,
-                    'elapsed_time': elapsed_time,
-                    'episode_length': lengths_results[(agents_num, repeat)],
-                    'reward': rewards_results[(agents_num, repeat)],
-                    'collisions': collisions_results[(agents_num, repeat)],
+                    'episode_runtime_seconds': elapsed_time,
+                    'episode_length_steps': lengths_results[(agents_num, repeat)],
+                    'total_reward': rewards_results[(agents_num, repeat)],
+                    'total_collisions': collisions_results[(agents_num, repeat)],
                     'collision_agent_agent': collision_agent_agent_results[(agents_num, repeat)],
                     'collision_agent_obstacle': collision_agent_obstacle_results[(agents_num, repeat)],
-                    'throughput': throughput_results[(agents_num, repeat)],
-                    'path_efficiency': efficiency_results[(agents_num, repeat)],
+                    'throughput_steps_per_sec': throughput_results[(agents_num, repeat)],
                     'wait_actions': wait_actions_results[(agents_num, repeat)],
-                    'goal_completion_rate': goal_completion_rate_results[(agents_num, repeat)],
-                    'avg_steps_to_goal': avg_steps_to_goal_results[(agents_num, repeat)]
+                    'goal_completion_rate_percent': goal_completion_rate_results[(agents_num, repeat)],
+                    'average_steps_to_goal': avg_steps_to_goal_results[(agents_num, repeat)],
+                    'completion_step_deviation': completion_deviation_results[(agents_num, repeat)]
                 })
 
             df = pd.DataFrame(df_data)

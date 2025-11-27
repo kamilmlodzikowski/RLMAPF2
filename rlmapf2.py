@@ -145,6 +145,15 @@ class RLMAPF(MultiAgentEnv):
             "cycle_maps_without_replacement": False,
             "shuffle_map_cycle": True,
             "print_map_usage": True,
+            # Collision priority multipliers (relative: left > bottom > right > top)
+            "use_collision_priority_multiplier": True,
+            "collision_priority_weights": {
+                "left": 1.0,
+                "bottom": 0.75,
+                "right": 0.5,
+                "top": 0.25,
+            },
+            "collision_priority_multiplier_range": (0.5, 1.5),
         }
         return default_config
 
@@ -277,7 +286,60 @@ class RLMAPF(MultiAgentEnv):
                 "style_label": style_labels.get(linestyle, "pattern"),
                 "color_hex": mcolors.to_hex(rgb),
             }
-                
+    
+    def _collision_priority_multiplier(
+        self,
+        self_pos: Optional[Tuple[int, int]],
+        other_pos: Optional[Tuple[int, int]] = None,
+    ) -> float:
+        """
+        Scale collision penalties based on relative position priority (left > bottom > right > top).
+        """
+        if not self.config.get("use_collision_priority_multiplier", False):
+            return 1.0
+        if self_pos is None:
+            return 1.0
+
+        if other_pos is None:
+            return 1.0
+
+        default_weights = {"left": 1.0, "bottom": 0.75, "right": 0.5, "top": 0.25}
+        user_weights = self.config.get("collision_priority_weights", {}) or {}
+        weights = {**default_weights}
+        for key in default_weights:
+            if key in user_weights:
+                try:
+                    weights[key] = float(user_weights[key])
+                except (TypeError, ValueError):
+                    pass
+
+        range_cfg = self.config.get("collision_priority_multiplier_range", (0.5, 1.5))
+        try:
+            min_mult, max_mult = float(range_cfg[0]), float(range_cfg[1])
+        except Exception:
+            min_mult, max_mult = 0.5, 1.5
+        if max_mult < min_mult:
+            min_mult, max_mult = max_mult, min_mult
+
+        dx = self_pos[0] - other_pos[0]
+        dy = self_pos[1] - other_pos[1]
+        if dx == 0 and dy == 0:
+            return 1.0
+
+        if abs(dx) >= abs(dy):
+            direction = "left" if dx < 0 else "right"
+        else:
+            direction = "bottom" if dy > 0 else "top"
+
+        weight = weights.get(direction, 1.0)
+        min_weight = min(weights.values())
+        max_weight = max(weights.values())
+        if max_weight - min_weight <= 0:
+            return 1.0
+
+        normalized = np.clip((weight - min_weight) / (max_weight - min_weight), 0.0, 1.0)
+        return min_mult + normalized * (max_mult - min_mult)
+
     def reset(self, seed=None, options=None):
         """
         Resets the environment to its initial state.
@@ -453,8 +515,24 @@ class RLMAPF(MultiAgentEnv):
         current_state = {agent: self.agent_positions[agent] for agent in self._agent_ids}
         new_state = {agent: self.agent_positions[agent] for agent in self._agent_ids}
 
-        def penalize(agent, penalty=self.collision_penalty):
+        def apply_penalty(agent, penalty):
             self.rewards[agent] -= penalty
+
+        def apply_collision_penalty(agent, penalty=None, position=None, other_positions=None):
+            base_penalty = self.collision_penalty if penalty is None else penalty
+            pos = position
+            if pos is None:
+                pos = current_state.get(agent, self.agent_positions.get(agent))
+            others = other_positions or []
+            multipliers = []
+            for other_pos in others:
+                mult = self._collision_priority_multiplier(pos, other_pos)
+                multipliers.append(mult)
+            if multipliers:
+                multiplier = float(np.mean(multipliers))
+            else:
+                multiplier = 1.0
+            apply_penalty(agent, base_penalty * multiplier)
 
         def reward(agent, reward=self.goal_reward):
             self.rewards[agent] += reward
@@ -484,16 +562,16 @@ class RLMAPF(MultiAgentEnv):
             # Check if the new position is out of bounds
             if not (0 <= new_pos[0] < self.grid_size[0] and 0 <= new_pos[1] < self.grid_size[1]):
                 if self.config["penalize_collision"]:
-                    penalize(agent)
+                    apply_collision_penalty(agent, position=current_state[agent])
                 new_pos = current_state[agent]  # Revert to the current position
             
             # Penalize for moving
             if action != 4:
                 if self.config["penalize_steps"]:
-                    penalize(agent, penalty=self.step_cost)
+                    apply_penalty(agent, self.step_cost)
             else:
                 if self.config["penalize_waiting"]:
-                    penalize(agent, penalty=self.step_cost * self.wait_cost_multiplier)
+                    apply_penalty(agent, self.step_cost * self.wait_cost_multiplier)
 
             new_state[agent] = new_pos
 
@@ -502,15 +580,23 @@ class RLMAPF(MultiAgentEnv):
             # Check for collisions with obstacles
             if new_pos in self.obstacles:
                 if self.config["penalize_collision"]:
-                    penalize(agent)
+                    apply_collision_penalty(agent, position=new_pos)
                 self.number_of_collisions[agent] += 1
                 new_state[agent] = current_state[agent]
 
             for agent2, new_pos2 in new_state.items():
                 if agent2 != agent and new_pos2 == current_state[agent] and new_pos == current_state[agent2]:
                     if self.config["penalize_collision"]:
-                        penalize(agent)
-                        penalize(agent2)
+                        apply_collision_penalty(
+                            agent,
+                            position=current_state[agent],
+                            other_positions=[current_state[agent2]],
+                        )
+                        apply_collision_penalty(
+                            agent2,
+                            position=current_state[agent2],
+                            other_positions=[current_state[agent]],
+                        )
                     self.number_of_collisions[agent] += 1
                     self.number_of_collisions[agent2] += 1
                     new_state[agent] = current_state[agent]
@@ -525,7 +611,15 @@ class RLMAPF(MultiAgentEnv):
                     agents_to_penalize = [a for a, p in new_state.items() if p == new_pos]
                     if self.config["penalize_collision"]:
                         for agent_to_penalize in agents_to_penalize:
-                            penalize(agent_to_penalize)
+                            apply_collision_penalty(
+                                agent_to_penalize,
+                                position=current_state.get(agent_to_penalize, new_pos),
+                                other_positions=[
+                                    current_state.get(a, new_pos)
+                                    for a in agents_to_penalize
+                                    if a != agent_to_penalize
+                                ],
+                            )
                     for agent_to_penalize in agents_to_penalize:
                         self.number_of_collisions[agent_to_penalize] += 1
                     for agent_to_penalize in agents_to_penalize:
@@ -560,11 +654,11 @@ class RLMAPF(MultiAgentEnv):
                         if pos1_prev[0] == pos2_prev[0] and abs(pos1_prev[1] - pos2_prev[1]) == 1:
                             # Penalize when the agent going up is to the left (lower x)
                             if action1 == 0 and pos1_prev[0] < pos2_prev[0]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
+                                apply_penalty(agent1, 0.1)
+                                apply_penalty(agent2, 0.1)
                             elif action2 == 0 and pos2_prev[0] < pos1_prev[0]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
+                                apply_penalty(agent1, 0.1)
+                                apply_penalty(agent2, 0.1)
 
                     # Left/Right passing
                     if (action1 == 2 and action2 == 3) or (action1 == 3 and action2 == 2):
@@ -572,11 +666,11 @@ class RLMAPF(MultiAgentEnv):
                         if pos1_prev[1] == pos2_prev[1] and abs(pos1_prev[0] - pos2_prev[0]) == 1:
                             # Penalize when the agent going left is below (higher y)
                             if action1 == 2 and pos1_prev[1] > pos2_prev[1]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
+                                apply_penalty(agent1, 0.1)
+                                apply_penalty(agent2, 0.1)
                             elif action2 == 2 and pos2_prev[1] > pos1_prev[1]:
-                                penalize(agent1, penalty=0.1)
-                                penalize(agent2, penalty=0.1)
+                                apply_penalty(agent1, 0.1)
+                                apply_penalty(agent2, 0.1)
         # Update D* Lite paths only if enabled
         d_star_progress_weight = float(self.config.get("d_star_path_progress_weight", 0.0))
         prev_d_star_lengths = {}
@@ -585,18 +679,54 @@ class RLMAPF(MultiAgentEnv):
                 prev_d_star_lengths = {
                     agent: len(self.d_star_paths.get(agent, [])) for agent in self._agent_ids
                 }
-            planned_paths_static = getattr(self, "d_star_planned_paths", {})
+
+            def _project_to_planned_path(full_path, current_pos):
+                """
+                Reuse the congestion-weighted path from reset and, if the agent
+                drifted, snap back to the nearest point on that path instead of
+                replanning a brand-new route.
+                """
+                if not full_path:
+                    return []
+                if current_pos in full_path:
+                    idx = full_path.index(current_pos)
+                    return full_path[idx:]
+
+                # Find closest waypoint on the original path (Manhattan distance).
+                best_idx = None
+                best_dist = None
+                for idx, cell in enumerate(full_path):
+                    dist = abs(cell[0] - current_pos[0]) + abs(cell[1] - current_pos[1])
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        best_idx = idx
+
+                if best_idx is None:
+                    return []
+
+                snapped_suffix = full_path[best_idx:]
+                if snapped_suffix and snapped_suffix[0] != current_pos:
+                    return [current_pos] + snapped_suffix
+                return snapped_suffix
+
+            planned_paths_static = getattr(self, "d_star_planned_paths", {}) or {}
             for agent in self._agent_ids:
-                full_path = planned_paths_static.get(agent, []) if planned_paths_static else []
-                if full_path and self.agent_positions[agent] in full_path:
-                    idx = full_path.index(self.agent_positions[agent])
-                    self.d_star_paths[agent] = full_path[idx:]
-                else:
+                full_path = planned_paths_static.get(agent, [])
+                if not full_path:
+                    # Fall back to a fresh plan only if we somehow missed the initial path.
                     path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
                     self.d_star_paths[agent] = path
-                    # Update the static reference if we had to deviate from the preplanned path.
-                    if planned_paths_static is not None:
+                    if agent not in planned_paths_static:
                         planned_paths_static[agent] = path
+                    continue
+
+                projected_path = _project_to_planned_path(full_path, self.agent_positions[agent])
+                if projected_path:
+                    self.d_star_paths[agent] = projected_path
+                else:
+                    # Absolute fallback: should rarely trigger, keeps agents from getting stuck.
+                    path, _, _ = self.d_stars[agent].move_and_replan(self.agent_positions[agent])
+                    self.d_star_paths[agent] = path
 
             if d_star_progress_weight != 0.0:
                 for agent in self._agent_ids:

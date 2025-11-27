@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import math
@@ -21,6 +22,8 @@ import numpy as np
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
+from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
+from ray.rllib.utils.spaces.space_utils import flatten_to_single_ndarray
 
 import matplotlib.pyplot as plt
 
@@ -224,8 +227,12 @@ def build_environment_config(config: TrainConfig, seed: Optional[int] = None) ->
     env_config.setdefault("map_path", str(config.paths.map_root))
     if not env_config.get("maps_names_with_variants"):
         raise ValueError("Config must specify environment.maps_names_with_variants")
-    if seed is not None and env_config.get("seed") is None:
-        env_config["seed"] = seed
+    # For training envs we only fix the seed when the user explicitly
+    # requested one via the environment config itself. Otherwise RLlib
+    # will create env instances with their own RNG streams, improving
+    # diversity across episodes and workers.
+    if env_config.get("seed") is not None:
+        env_config["seed"] = int(env_config["seed"])
     return env_config
 
 
@@ -233,8 +240,10 @@ def build_evaluation_env_config(config: TrainConfig, seed: Optional[int]) -> Dic
     env_config = build_environment_config(config)
     eval_overrides = dict(config.evaluation_environment)
     env_config.update(eval_overrides)
-    if seed is not None and env_config.get("seed") is None:
-        env_config["seed"] = seed
+    # Evaluation keeps a deterministic seed per run unless the user
+    # explicitly overrides it in the evaluation_environment block.
+    if env_config.get("seed") is None and seed is not None:
+        env_config["seed"] = int(seed)
     return env_config
 
 
@@ -245,11 +254,21 @@ def _generate_seed() -> int:
 def resolve_run_seeds(config: TrainConfig) -> Tuple[int, int, bool, bool]:
     explicit_train_seed = config.environment.get("seed")
     original_train_seed = config.training.random_seed
+    # Training seed is kept for reproducibility metadata only. We no
+    # longer push it into env_config unless the user also set
+    # environment.seed explicitly.
     if explicit_train_seed is not None:
-        training_seed = explicit_train_seed
+        training_seed = int(explicit_train_seed)
+        config.training.random_seed = training_seed
     else:
-        training_seed = original_train_seed if original_train_seed is not None else _generate_seed()
-    config.training.random_seed = training_seed
+        training_seed = None
+    # else:
+    #     training_seed = (
+    #         int(original_train_seed)
+    #         if original_train_seed is not None
+    #         else _generate_seed()
+    #     )
+    # config.training.random_seed = training_seed
 
     explicit_eval_seed = config.evaluation_environment.get("seed")
     original_eval_seed = config.training.evaluation_seed
@@ -482,6 +501,8 @@ def record_policy_video(
     env_config["render_config"] = render_config
 
     env = None
+    policy = None
+    policy_id = DEFAULT_POLICY_ID
     try:
         # For render-only rollouts we do not want to reuse the evaluation seed;
         # drop it so the video samples a fresh map/layout like the live evals.
@@ -490,6 +511,28 @@ def record_policy_video(
         if recording_seed is not None:
             logger.debug("Record policy video ignoring fixed seed %s to capture varied layouts", recording_seed)
         observations, _ = env.reset()  # Random seed to avoid repeating the same map
+
+        try:
+            policy = algorithm.get_policy(policy_id)  # type: ignore[attr-defined]
+        except Exception:
+            policy = algorithm.get_policy()  # type: ignore[attr-defined]
+            policy_id = getattr(policy, "policy_id", DEFAULT_POLICY_ID)
+        if policy is None:
+            raise RuntimeError("Unable to retrieve policy for video recording")
+
+        state_init = policy.get_initial_state()
+        use_lstm = len(state_init) > 0
+
+        def _copy_state_template():
+            if not state_init:
+                return []
+            return [np.copy(s) if isinstance(s, np.ndarray) else s for s in state_init]
+
+        action_template = flatten_to_single_ndarray(policy.action_space.sample())  # type: ignore[attr-defined]
+        agent_states: collections.defaultdict[str, List[Any]] = collections.defaultdict(_copy_state_template)
+        prev_actions = collections.defaultdict(lambda: np.copy(action_template))
+        prev_rewards = collections.defaultdict(float)
+
         max_steps = max_render_steps or env_config.get("max_steps") or env.max_steps
         step = 0
         while step < max_steps:
@@ -497,30 +540,29 @@ def record_policy_video(
             # observation structure (avoid passing a multi-agent obs dict directly).
             int_actions: Dict[str, int] = {}
             for agent_id, obs in observations.items():
-                # Default to the single (default) policy used during training.
-                try:
-                    result = algorithm.compute_single_action(obs, explore=False, policy_id="default_policy")  # type: ignore[attr-defined]
-                except TypeError:
-                    # Some RLlib versions don't require/allow policy_id here.
-                    result = algorithm.compute_single_action(obs, explore=False)  # type: ignore[attr-defined]
-                except Exception:
-                    # Fallback to explicit policy API if available.
-                    try:
-                        policy = algorithm.get_policy("default_policy")  # type: ignore[attr-defined]
-                    except Exception:
-                        policy = algorithm.get_policy()  # type: ignore[attr-defined]
-                    result = policy.compute_single_action(obs, explore=False)  # type: ignore[attr-defined]
+                policy_state = agent_states[agent_id]
+                action_result = policy.compute_single_action(  # type: ignore[attr-defined]
+                    obs,
+                    state=policy_state,
+                    prev_action=prev_actions[agent_id],
+                    prev_reward=prev_rewards[agent_id],
+                    explore=False,
+                )
+                action, new_state, _ = action_result
+                if use_lstm:
+                    agent_states[agent_id] = new_state
 
-                # Support both return shapes: action or (action, state_out, info)
-                action = result[0] if isinstance(result, tuple) else result
+                action = flatten_to_single_ndarray(action)
+                prev_actions[agent_id] = action
 
                 # RLlib may return numpy scalars/arrays; normalise to ints for the env.
-                if isinstance(action, tuple):
-                    action = action[0]
                 if isinstance(action, (list, np.ndarray)):
                     action = np.asarray(action).item()
                 int_actions[agent_id] = int(action)
-            observations, _, terminateds, truncateds, _ = env.step(int_actions)
+            observations, rewards, terminateds, truncateds, _ = env.step(int_actions)
+            if isinstance(rewards, dict):
+                for agent_id, reward in rewards.items():
+                    prev_rewards[agent_id] = reward if reward is not None else 0.0
             step += 1
             if terminateds.get("__all__", False) or truncateds.get("__all__", False):
                 break

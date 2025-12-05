@@ -331,16 +331,18 @@ class RLMAPF(MultiAgentEnv):
 
         # Render
         if self.render_mode == "human":
-            self.render(clear=False, 
+            self.render(clear=False,
                         title=self.render_config["title"],
-                        save_frames=self.render_config["save_frames"], 
-                        frames_path=self.render_config["frames_path"], 
-                        save_video=self.render_config["save_video"], 
+                        save_frames=self.render_config["save_frames"],
+                        frames_path=self.render_config["frames_path"],
+                        save_video=self.render_config["save_video"],
                         video_path=self.render_config["video_path"],
                         show_render=self.render_config["show_render"],
                         render_delay=self.render_config["render_delay"],
                         include_legend=self.render_config["include_legend"],
-                        legend_position=self.render_config["legend_position"])
+                        legend_position=self.render_config["legend_position"],
+                        smooth_motion=self.render_config.get("smooth_motion", False),
+                        motion_frames=self.render_config.get("motion_frames", 5))
 
         return self._get_observations(), self._get_info()
 
@@ -558,17 +560,19 @@ class RLMAPF(MultiAgentEnv):
 
         # Render
         if self.render_mode == "human":
-            self.render(clear=False, 
+            self.render(clear=False,
                         title=self.render_config["title"],
-                        save_frames=self.render_config["save_frames"], 
-                        frames_path=self.render_config["frames_path"], 
-                        save_video=self.render_config["save_video"], 
+                        save_frames=self.render_config["save_frames"],
+                        frames_path=self.render_config["frames_path"],
+                        save_video=self.render_config["save_video"],
                         video_path=self.render_config["video_path"],
                         show_render=self.render_config["show_render"],
                         render_delay=self.render_config["render_delay"],
                         include_legend=self.render_config["include_legend"],
-                        legend_position=self.render_config["legend_position"])
-            
+                        legend_position=self.render_config["legend_position"],
+                        smooth_motion=self.render_config.get("smooth_motion", False),
+                        motion_frames=self.render_config.get("motion_frames", 5))
+
 
         return self._get_observations(), self.rewards, terminateds, truncateds, self._get_info()
     

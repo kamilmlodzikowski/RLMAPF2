@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import numbers
+import os
 import secrets
 import subprocess
 import sys
@@ -186,6 +187,13 @@ def collect_overrides(args: argparse.Namespace) -> List[str]:
     if legacy_bool is not None:
         overrides.append(f"environment.use_cnn_observation={legacy_bool}")
     return overrides
+
+
+def _has_wandb_credentials() -> bool:
+    """Best-effort check that wandb can run without interactive login."""
+    if os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_API_KEY_FILE"):
+        return True
+    return (Path.home() / ".netrc").exists()
 
 
 def build_run_name(config: TrainConfig, explicit_name: Optional[str]) -> str:
@@ -529,6 +537,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if config.run.use_wandb and wandb is None:
         logger.warning("wandb is not installed. Disabling Weights & Biases logging.")
+        config.run.use_wandb = False
+    if config.run.use_wandb and not _has_wandb_credentials():
+        logger.warning(
+            "wandb credentials not configured (no API key or ~/.netrc). Disabling Weights & Biases logging."
+        )
         config.run.use_wandb = False
 
     run_name = build_run_name(config, args.run_name)

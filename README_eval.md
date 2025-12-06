@@ -8,7 +8,9 @@ Evaluate trained PPO agents on multi-agent pathfinding tasks.
 pip install ray[rllib] numpy pandas pyyaml matplotlib
 ```
 
-## Basic Usage
+## Purpose
+
+Load an eval YAML, restore a trained checkpoint, run the RLMAPF environment across agent counts (and optional multiple maps), collect key metrics (success/deadlock, efficiency, safety), and emit CSVs/plots/videos for comparison.
 
 ### Without Video (Fast)
 
@@ -118,3 +120,6 @@ python eval.py --config multi_map --checkpoint 1 \
 - Use `--video-agents N` to render only specific agent count
 - Results include git commit hash for reproducibility
 - **Multi-map runs**: enable via `eval_maps.enabled: true` in the config. Each map gets its own `map_<label>/` folder plus a `cross_map_comparison/` directory with aggregated plots and CSVs. Use a low-cost smoke test (e.g., `--set eval_agents_range=4-4 --repeats 1`) before launching long sweeps.
+
+In short: eval.py is a thin, reproducible harness that loads a trained PPO model, runs it on the RLMAPF env under configurable conditions, aggregates the most decision-relevant metrics, and exports CSVs/plots (and optional videos) using Ray RLlib for policy execution, pandas/numpy for 
+math, and matplotlib for visuals.

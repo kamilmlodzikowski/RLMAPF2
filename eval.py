@@ -982,7 +982,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 episode_len = step_count
                 wait_actions = sum(1 for action_set in actions_history for action in action_set.values() if action == 4)
                 goal_completion_rate = (len(agents_reached_goal) / total_agents * 100) if total_agents > 0 else 0
-                success = len(agents_reached_goal) == total_agents and episode_len < max_steps
+                success = (
+                    episode_len < max_steps
+                    and total_agents > 0
+                    and goal_completion_rate >= 99.9
+                )
                 avg_steps_to_goal = (
                     sum(agent_completion_steps.values()) / len(agent_completion_steps)
                     if agent_completion_steps
@@ -1308,6 +1312,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Save summary CSV
             summary_df = pd.DataFrame(summary_data)
             summary_df.to_csv(str(current_results_dir / 'summary.csv'), index=False)
+
+            # Save a compact at-a-glance CSV with headline metrics
+            headline_cols = [
+                'agents_num',
+                'success_rate_percent',
+                'deadlock_rate_percent',
+                'avg_success_length_steps',
+                'avg_throughput_steps_per_sec',
+                'avg_collision_agent_agent_per_agent_step',
+                'avg_collision_agent_obstacle_per_agent_step',
+                'avg_collision_total_per_agent_step',
+                'avg_path_efficiency',
+            ]
+            existing_cols = [c for c in headline_cols if c in summary_df.columns]
+            if existing_cols:
+                summary_df[existing_cols].to_csv(str(current_results_dir / 'at_a_glance.csv'), index=False)
 
             # Store summary path for cross-map comparison
             if multi_map_enabled:

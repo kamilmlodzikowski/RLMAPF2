@@ -123,3 +123,20 @@ python eval.py --config multi_map --checkpoint 1 \
 
 In short: eval.py is a thin, reproducible harness that loads a trained PPO model, runs it on the RLMAPF env under configurable conditions, aggregates the most decision-relevant metrics, and exports CSVs/plots (and optional videos) using Ray RLlib for policy execution, pandas/numpy for 
 math, and matplotlib for visuals.
+
+## Metrics Cheat Sheet (How to Read Plots/CSVs)
+
+- **Success rate (%)**: Share of episodes where all agents reach goals before `max_steps`. Higher is better; complements deadlock when episodes end due to step limit.
+- **Deadlock rate (%)**: Episodes that hit `max_steps` (stuck or too slow). Lower is better; if deadlock is high, success is usually low.
+- **Episode length (successful only)**: Steps taken when success occurs. Lower means faster completion among successes; ignore if success rate is near zero.
+- **Throughput (steps/s)**: How quickly the system advances per wall-clock second. Higher is better, but interpret with collisions/success to avoid “fast but failing.”
+- **Path efficiency (actual/optimal)**: Ratio vs D* start-path lengths (when available). Values near 1.0 mean near-optimal paths; higher indicates detours/inefficiency.
+- **Collisions per agent-step (agent–agent / agent–obstacle)**: Normalised collision rates; lower is safer. Agent–agent vs agent–obstacle split indicates whether issues are coordination or map contact.
+- **Goal completion rate (%)**: Fraction of agents reaching goals (per run); similar to success but not all-or-nothing if partial completions occur.
+- **Wait actions** (CSV): Congestion proxy; higher wait counts can signal blocked flow—use alongside collisions and throughput.
+
+Reading the plots:
+- `success_deadlocks.png`: Success and deadlock vs agent count; high success + low deadlock is desired.
+- `efficiency.png`: Episode length (success-only), throughput, and path efficiency (if available) vs agent count; look for short lengths and reasonable throughput.
+- `collisions.png`: Stacked bars of collision rates per agent-step (agent–agent vs agent–obstacle); lower is better, and the split shows coordination vs obstacle issues.
+- `tradeoffs.png`: Scatter of success vs collisions and success vs length; good models sit top-left (high success, low collisions/short length).

@@ -209,7 +209,7 @@ def parse_video_agent_selection(selection: Optional[str]) -> Optional[Set[int]]:
 
 
 def resolve_checkpoint_path(checkpoint_arg: str,
-                            experiments_roots: Union[str, Path, Iterable[Union[str, Path]]] = "experiments") -> str:
+                            experiments_roots: Union[str, Path, Iterable[Union[str, Path]]] = ("experiments/train", "experiments")) -> str:
     """
     Resolve checkpoint argument to full path.
 
@@ -228,12 +228,12 @@ def resolve_checkpoint_path(checkpoint_arg: str,
     if checkpoint_arg.isdigit():
         n = int(checkpoint_arg)
 
-        if isinstance(experiments_roots, (str, Path)):
-            roots: List[Union[str, Path]] = [experiments_roots]
-        else:
-            roots = list(experiments_roots)
-        if not roots:
-            roots = ["experiments"]
+    if isinstance(experiments_roots, (str, Path)):
+        roots: List[Union[str, Path]] = [experiments_roots]
+    else:
+        roots = list(experiments_roots)
+    if not roots:
+        roots = ["experiments/train", "experiments"]
 
         checkpoint_dirs: List[Path] = []
         for experiments_root in roots:
@@ -495,6 +495,49 @@ def plot_collisions(detailed_results_path: Path, plots_dir: Path) -> None:
         logger.info("Collision plot saved")
     except Exception as exc:
         logger.warning("Could not generate collision plot: %s", exc)
+
+
+def plot_tradeoffs(summary_path: Path, plots_dir: Path) -> None:
+    """Trade-off plots to judge efficiency vs safety and success."""
+    try:
+        summary = pd.read_csv(summary_path)
+        if summary.empty:
+            logger.warning("Summary CSV empty; skipping trade-off plots")
+            return
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Success vs collisions
+        if {'success_rate_percent', 'avg_collision_total_per_agent_step', 'agents_num'}.issubset(summary.columns):
+            axes[0].scatter(summary['avg_collision_total_per_agent_step'], summary['success_rate_percent'],
+                            c=summary['agents_num'], cmap='viridis', s=80, edgecolors='k')
+            for _, row in summary.iterrows():
+                axes[0].annotate(int(row['agents_num']),
+                                 (row['avg_collision_total_per_agent_step'], row['success_rate_percent']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[0].set_xlabel('Collisions per agent-step')
+            axes[0].set_ylabel('Success rate (%)')
+            axes[0].set_title('Success vs Collisions')
+            axes[0].grid(True, alpha=0.3)
+
+        # Success vs length (successful episodes only)
+        if {'avg_success_length_steps', 'success_rate_percent', 'agents_num'}.issubset(summary.columns):
+            axes[1].scatter(summary['avg_success_length_steps'], summary['success_rate_percent'],
+                            c=summary['agents_num'], cmap='plasma', s=80, edgecolors='k')
+            for _, row in summary.iterrows():
+                axes[1].annotate(int(row['agents_num']),
+                                 (row['avg_success_length_steps'], row['success_rate_percent']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[1].set_xlabel('Episode length (successful only)')
+            axes[1].set_ylabel('Success rate (%)')
+            axes[1].set_title('Success vs Efficiency')
+            axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'tradeoffs.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Trade-off plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate trade-off plots: %s", exc)
 
 
 def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
@@ -763,127 +806,57 @@ def main(argv: Optional[List[str]] = None) -> int:
                     video_path = str(results_dir / video_filename)
                     logger.info("Rendering video to: %s", video_path)
             
-                # For video rendering, manually step through environment
+                # Build algorithm once per repeat with non-video env config
+                eval_env_config = configure_env(
+                    config,
+                    agents_num=agents_num,
+                    render_mode="none",
+                    seed=42 + repeat,
+                    render_video=False,
+                )
+                algo_config = algorithm_config_builder.environment(RLMAPF, env_config=eval_env_config)
+                temp_algorithm = algo_config.build()
+                temp_algorithm.restore(CHECKPOINT_PATH)
+                policy = temp_algorithm.get_policy()
+
+                # Optional video rollout using the same policy
                 if should_render:
-                    # Create environment directly with video rendering enabled
-                    env_config_dict = configure_env(
+                    video_env_config = configure_env(
                         config,
                         agents_num=agents_num,
-                        render_mode=None,  # Will be set by configure_env
+                        render_mode=None,  # configure_env sets human for video
                         seed=42 + repeat,
                         render_video=True,
-                        video_path=video_path
+                        video_path=video_path,
                     )
-                
-                    # RLMAPF is already imported at the top of the file
-                    env = RLMAPF(env_config_dict)
-                
-                    # Load policy from checkpoint
-                    temp_algorithm = algorithm_config_builder.build()
-                    temp_algorithm.restore(CHECKPOINT_PATH)
-                    policy = temp_algorithm.get_policy()
-
+                    video_env = RLMAPF(video_env_config)
                     try:
-                        # Run episode manually
-                        start_time = time.time()
-                        obs, info = env.reset()
-                        done = False
-                        step_count = 0
-                        max_steps = env_config_dict['max_steps']
-
-                        while not done and step_count < max_steps:
-                            # Get actions from policy
-                            actions = {}
-                            for agent_id, agent_obs in obs.items():
-                                action = policy.compute_single_action(agent_obs)[0]
-                                actions[agent_id] = action
-                        
-                            # Step environment (render() called automatically inside step())
-                            obs, rewards, dones, truncated, info = env.step(actions)
-                            step_count += 1
-                            done = all(dones.values()) or all(truncated.values())
-
-                        # CRITICAL: Finalize video to save it
-                        env.finalize_video()
-                        env.close()
-
-                        elapsed_time = time.time() - start_time
-                        episode_len = step_count
-
+                        obs, info = video_env.reset()
+                        step_count_video = 0
+                        max_steps_video = video_env_config['max_steps']
+                        while step_count_video < max_steps_video:
+                            actions = {aid: policy.compute_single_action(aobs)[0] for aid, aobs in obs.items()}
+                            obs, rewards, dones, truncated, info = video_env.step(actions)
+                            step_count_video += 1
+                            if all(dones.values()) or all(truncated.values()):
+                                break
+                        video_env.finalize_video()
+                        video_env.close()
                         logger.info("Video saved to: %s", video_path)
-                    finally:
-                        # Cleanup temporary algorithm
-                        temp_algorithm.stop()
-                        del temp_algorithm
-                else:
-                    # Normal evaluation without video using RLlib's evaluate()
-                    eval_config = algorithm_config_builder.environment(
-                        RLMAPF,
-                        env_config=configure_env(
-                            config,
-                            agents_num=agents_num,
-                            render_mode="none",
-                            seed=42 + repeat,
-                            render_video=False
-                        )
-                    )
-                
-                    eval_algorithm = eval_config.build()
-                    eval_algorithm.restore(CHECKPOINT_PATH)
-                
-                    start_time = time.time()
-                    try:
-                        results = eval_algorithm.evaluate()
-                        elapsed_time = time.time() - start_time
-                        episode_len = results['env_runners']['episode_len_mean']
-                    except Exception as e:
-                        logger.error("Error during evaluation: %s", e)
-                        return (
-                            agents_num,
-                            repeat,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            False,
-                            np.nan,
-                            np.nan,
-                            np.nan,
-                            np.nan,
-                            np.nan,
-                            1,
-                        )
-                    finally:
-                        eval_algorithm.stop()
-            
-                # Check for deadlock
-                max_steps = env_config.get('max_steps', 250)
-                deadlock = 0 if episode_len < max_steps else 1
-            
-                logger.debug("Completed in %.5fs, steps: %.2f", elapsed_time, episode_len)
-            
+                    except Exception as exc:
+                        logger.warning("Video rendering failed: %s", exc)
 
-                # Always run episodes manually to collect detailed metrics
+                # Manual metrics run using the same policy/algorithm
                 env_config_dict = configure_env(
                     config,
                     agents_num=agents_num,
-                    render_mode=None,
+                    render_mode="none",
                     seed=42 + repeat,
-                    render_video=should_render,
+                    render_video=False,
                     video_path=video_path
                 )
 
                 env = RLMAPF(env_config_dict)
-                temp_algorithm = algorithm_config_builder.build()
-                temp_algorithm.restore(CHECKPOINT_PATH)
-                policy = temp_algorithm.get_policy()
 
                 try:
                     start_time = time.time()
@@ -899,10 +872,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     agent_agent_collision_total = 0
                     agent_obstacle_collision_total = 0
                     prev_positions = {}
-                    total_agents = len(env.agents) if hasattr(env, 'agents') else agents_num
+                    total_agents = env_config_dict.get("agents_num", agents_num)
+                    agent_ids_for_counters = list(getattr(env, "agent_positions", {}).keys()) or list(obs.keys())
                     collision_counters = {
                         agent_id: info.get(agent_id, {}).get("number_of_collisions", 0)
-                        for agent_id in obs.keys()
+                        for agent_id in agent_ids_for_counters
                     }
 
                     while not done and step_count < max_steps:
@@ -1347,6 +1321,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 plot_success_and_deadlocks(detailed_results_csv, plots_dir)
                 plot_efficiency(detailed_results_csv, plots_dir)
                 plot_collisions(detailed_results_csv, plots_dir)
+                plot_tradeoffs(current_results_dir / 'summary.csv', plots_dir)
                 logger.info("Plots generated in: %s", plots_dir)
             else:
                 logger.warning("Detailed results CSV not found, skipping plotting")

@@ -224,16 +224,18 @@ def resolve_checkpoint_path(checkpoint_arg: str,
     Returns:
         Full path to checkpoint directory
     """
-    # If it's a digit, find the Nth most recent checkpoint
-    if checkpoint_arg.isdigit():
-        n = int(checkpoint_arg)
+    arg_str = str(checkpoint_arg).strip()
 
-    if isinstance(experiments_roots, (str, Path)):
-        roots: List[Union[str, Path]] = [experiments_roots]
-    else:
-        roots = list(experiments_roots)
-    if not roots:
-        roots = ["experiments/train", "experiments"]
+    # If it's a digit, find the Nth most recent checkpoint
+    if arg_str.isdigit():
+        n = int(arg_str)
+
+        if isinstance(experiments_roots, (str, Path)):
+            roots: List[Union[str, Path]] = [experiments_roots]
+        else:
+            roots = list(experiments_roots)
+        if not roots:
+            roots = ["experiments/train", "experiments"]
 
         checkpoint_dirs: List[Path] = []
         for experiments_root in roots:
@@ -265,8 +267,13 @@ def resolve_checkpoint_path(checkpoint_arg: str,
         logger.info(f"Checkpoint #{n} resolved to: {selected_checkpoint}")
         return str(selected_checkpoint)
 
-    # Otherwise, return the path as-is
-    return checkpoint_arg
+    # Otherwise, treat as explicit path
+    path = Path(arg_str).expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint path not found: {path}")
+    return str(path)
 
 
 def collect_git_info(repo_root: Path) -> Dict[str, Any]:
@@ -411,6 +418,7 @@ def plot_success_and_deadlocks(detailed_results_path: Path, plots_dir: Path) -> 
         if 'success' not in df.columns:
             logger.warning("Success column not found; skipping success plot")
             return
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
         summary = df.groupby('agents_num').agg(
             success_rate_percent=('success', lambda s: s.mean() * 100.0),
             deadlock_rate_percent=('deadlock', lambda s: s.mean() * 100.0 if 'deadlock' in df.columns else np.nan),
@@ -421,7 +429,10 @@ def plot_success_and_deadlocks(detailed_results_path: Path, plots_dir: Path) -> 
             ax.plot(summary['agents_num'], summary['deadlock_rate_percent'], marker='s', label='Deadlock rate (%)')
         ax.set_xlabel('Number of agents')
         ax.set_ylabel('Rate (%)')
-        ax.set_title('Success and deadlock rates')
+        title = 'Success and deadlock rates'
+        if repeats_count:
+            title += f" (repeats={repeats_count})"
+        ax.set_title(title)
         ax.grid(True, alpha=0.3)
         ax.legend()
         plt.tight_layout()
@@ -436,6 +447,7 @@ def plot_efficiency(detailed_results_path: Path, plots_dir: Path) -> None:
     """Efficiency plots: episode length (successful), throughput, path efficiency."""
     try:
         df = pd.read_csv(detailed_results_path)
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
         metrics = [
             ('success_episode_length_steps', 'Episode length (successful only)'),
             ('throughput_steps_per_sec', 'Throughput (steps/s)'),
@@ -455,7 +467,10 @@ def plot_efficiency(detailed_results_path: Path, plots_dir: Path) -> None:
                             alpha=0.25, label='±1 std')
             ax.set_xlabel('Number of agents')
             ax.set_ylabel(title)
-            ax.set_title(title)
+            plot_title = title
+            if repeats_count:
+                plot_title += f" (repeats={repeats_count})"
+            ax.set_title(plot_title)
             ax.grid(True, alpha=0.3)
             ax.legend()
         plt.tight_layout()
@@ -474,6 +489,7 @@ def plot_collisions(detailed_results_path: Path, plots_dir: Path) -> None:
         if not required.issubset(df.columns):
             logger.warning("Collision rate columns not found; skipping collision plot")
             return
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
         summary = df.groupby('agents_num').agg({
             'collision_agent_agent_per_agent_step': 'mean',
             'collision_agent_obstacle_per_agent_step': 'mean',
@@ -486,7 +502,10 @@ def plot_collisions(detailed_results_path: Path, plots_dir: Path) -> None:
         ax.bar(x, aa, bottom=ao, label='Agent–Agent', color='coral', alpha=0.85)
         ax.set_xlabel('Number of agents')
         ax.set_ylabel('Collisions per agent-step')
-        ax.set_title('Safety: collisions by type')
+        title = 'Safety: collisions by type'
+        if repeats_count:
+            title += f" (repeats={repeats_count})"
+        ax.set_title(title)
         ax.grid(True, axis='y', alpha=0.3)
         ax.legend()
         plt.tight_layout()
@@ -504,33 +523,70 @@ def plot_tradeoffs(summary_path: Path, plots_dir: Path) -> None:
         if summary.empty:
             logger.warning("Summary CSV empty; skipping trade-off plots")
             return
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-        # Success vs collisions
-        if {'success_rate_percent', 'avg_collision_total_per_agent_step', 'agents_num'}.issubset(summary.columns):
-            axes[0].scatter(summary['avg_collision_total_per_agent_step'], summary['success_rate_percent'],
-                            c=summary['agents_num'], cmap='viridis', s=80, edgecolors='k')
+        # Success vs collisions (color by throughput)
+        if {'success_rate_percent', 'avg_collision_total_per_agent_step', 'avg_throughput_steps_per_sec', 'agents_num'}.issubset(summary.columns):
+            sc = axes[0].scatter(
+                summary['avg_collision_total_per_agent_step'],
+                summary['success_rate_percent'],
+                c=summary['avg_throughput_steps_per_sec'],
+                s=60,
+                cmap='viridis',
+                edgecolors='k',
+            )
             for _, row in summary.iterrows():
                 axes[0].annotate(int(row['agents_num']),
                                  (row['avg_collision_total_per_agent_step'], row['success_rate_percent']),
                                  textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
             axes[0].set_xlabel('Collisions per agent-step')
             axes[0].set_ylabel('Success rate (%)')
-            axes[0].set_title('Success vs Collisions')
+            axes[0].set_title('Success vs Collisions\n(color: throughput)')
             axes[0].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[0])
+            cbar.set_label('Throughput (steps/s)')
 
-        # Success vs length (successful episodes only)
-        if {'avg_success_length_steps', 'success_rate_percent', 'agents_num'}.issubset(summary.columns):
-            axes[1].scatter(summary['avg_success_length_steps'], summary['success_rate_percent'],
-                            c=summary['agents_num'], cmap='plasma', s=80, edgecolors='k')
+        # Success vs success-only length (color by collisions)
+        if {'avg_success_length_steps', 'success_rate_percent', 'avg_collision_total_per_agent_step', 'agents_num'}.issubset(summary.columns):
+            sc = axes[1].scatter(
+                summary['avg_success_length_steps'],
+                summary['success_rate_percent'],
+                c=summary['avg_collision_total_per_agent_step'],
+                s=60,
+                cmap='plasma',
+                edgecolors='k',
+            )
             for _, row in summary.iterrows():
                 axes[1].annotate(int(row['agents_num']),
                                  (row['avg_success_length_steps'], row['success_rate_percent']),
                                  textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
-            axes[1].set_xlabel('Episode length (successful only)')
+            axes[1].set_xlabel('Episode length (success only)')
             axes[1].set_ylabel('Success rate (%)')
-            axes[1].set_title('Success vs Efficiency')
+            axes[1].set_title('Success vs Efficiency\n(color: collisions)')
             axes[1].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[1])
+            cbar.set_label('Collisions per agent-step')
+
+        # Throughput vs collisions (color by success)
+        if {'avg_throughput_steps_per_sec', 'avg_collision_total_per_agent_step', 'success_rate_percent', 'agents_num'}.issubset(summary.columns):
+            sc = axes[2].scatter(
+                summary['avg_throughput_steps_per_sec'],
+                summary['avg_collision_total_per_agent_step'],
+                c=summary['success_rate_percent'],
+                s=60,
+                cmap='coolwarm',
+                edgecolors='k',
+            )
+            for _, row in summary.iterrows():
+                axes[2].annotate(int(row['agents_num']),
+                                 (row['avg_throughput_steps_per_sec'], row['avg_collision_total_per_agent_step']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[2].set_xlabel('Throughput (steps/s)')
+            axes[2].set_ylabel('Collisions per agent-step')
+            axes[2].set_title('Throughput vs Collisions\n(color: success)')
+            axes[2].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[2])
+            cbar.set_label('Success rate (%)')
 
         plt.tight_layout()
         plt.savefig(plots_dir / 'tradeoffs.png', dpi=300, bbox_inches='tight')
@@ -538,6 +594,59 @@ def plot_tradeoffs(summary_path: Path, plots_dir: Path) -> None:
         logger.info("Trade-off plots saved")
     except Exception as exc:
         logger.warning("Could not generate trade-off plots: %s", exc)
+
+
+def plot_variability(detailed_results_path: Path, plots_dir: Path, sample_counts: Optional[List[int]] = None) -> None:
+    """Boxplots for collisions and length to show spread across repeats at selected agent counts."""
+    try:
+        df = pd.read_csv(detailed_results_path)
+        if 'agents_num' not in df.columns or 'repeat' not in df.columns:
+            logger.warning("agents_num/repeat columns not found; skipping variability plots")
+            return
+        if 'collision_total_per_agent_step' not in df.columns:
+            logger.warning("collision_total_per_agent_step not found; skipping variability plots")
+            return
+        if sample_counts is None:
+            unique_agents = sorted(df['agents_num'].unique())
+            # Pick up to 3 evenly spaced agent counts
+            if len(unique_agents) >= 3:
+                sample_counts = [unique_agents[0], unique_agents[len(unique_agents)//2], unique_agents[-1]]
+            else:
+                sample_counts = unique_agents
+
+        # Filter only selected agent counts present in data
+        sample_counts = [c for c in sample_counts if c in df['agents_num'].unique()]
+        if not sample_counts:
+            logger.warning("No matching agent counts found for variability plots")
+            return
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Collisions per agent-step boxplot
+        collision_data = [df[df['agents_num'] == n]['collision_total_per_agent_step'].dropna() for n in sample_counts]
+        axes[0].boxplot(collision_data, labels=sample_counts, patch_artist=True)
+        axes[0].set_xlabel('Number of agents')
+        axes[0].set_ylabel('Collisions per agent-step')
+        axes[0].set_title('Collision variability across repeats')
+        axes[0].grid(True, axis='y', alpha=0.3)
+
+        # Episode length (success-only) boxplot
+        if 'success_episode_length_steps' in df.columns:
+            length_data = [df[df['agents_num'] == n]['success_episode_length_steps'].dropna() for n in sample_counts]
+            axes[1].boxplot(length_data, labels=sample_counts, patch_artist=True)
+            axes[1].set_xlabel('Number of agents')
+            axes[1].set_ylabel('Episode length (success only)')
+            axes[1].set_title('Length variability across repeats')
+            axes[1].grid(True, axis='y', alpha=0.3)
+        else:
+            axes[1].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'variability.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Variability plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate variability plots: %s", exc)
 
 
 def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
@@ -1322,6 +1431,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 plot_efficiency(detailed_results_csv, plots_dir)
                 plot_collisions(detailed_results_csv, plots_dir)
                 plot_tradeoffs(current_results_dir / 'summary.csv', plots_dir)
+                plot_variability(detailed_results_csv, plots_dir)
                 logger.info("Plots generated in: %s", plots_dir)
             else:
                 logger.warning("Detailed results CSV not found, skipping plotting")

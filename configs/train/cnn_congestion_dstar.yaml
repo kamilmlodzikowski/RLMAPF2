@@ -40,6 +40,7 @@ environment:
   use_d_star_lite: true
   d_star_iterations: 4
   d_star_congestion_weight: 0.5
+  d_star_path_progress_weight: 0.0
   use_cnn_observation: true
   collision_penalty: 0.1
   step_cost: 0.02
@@ -52,6 +53,7 @@ environment:
   reward_closer_to_goal_each_step: false
   reward_low_density: false
   penalize_left_side_bottom_passing: false
+  use_collision_priority_multiplier: false
   start_goal_on_periphery: true
   render_mode: none
   render_delay: 0.01
@@ -66,7 +68,9 @@ evaluation_environment:
   use_d_star_lite: true
   d_star_iterations: 4
   d_star_congestion_weight: 0.5
+  d_star_path_progress_weight: 0.0
   penalize_left_side_bottom_passing: false
+  use_collision_priority_multiplier: false
 logging:
   params_to_log:
     - env_runners/episode_reward_mean

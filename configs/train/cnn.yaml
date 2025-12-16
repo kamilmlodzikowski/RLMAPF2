@@ -38,6 +38,7 @@ environment:
   reward_closer_to_goal_final: true
   reward_final_d_star: false
   use_d_star_lite: false
+  d_star_path_progress_weight: 0.0
   use_cnn_observation: true
   collision_penalty: 0.1
   step_cost: 0.02
@@ -50,6 +51,7 @@ environment:
   reward_closer_to_goal_each_step: false
   reward_low_density: false
   penalize_left_side_bottom_passing: true
+  use_collision_priority_multiplier: false
   render_mode: none
   render_delay: 0.01
   maps_names_with_variants:
@@ -60,7 +62,9 @@ evaluation_environment:
   wait_cost_multiplier: 2
   reward_closer_to_goal_final: true
   reward_final_d_star: false
+  d_star_path_progress_weight: 0.0
   penalize_left_side_bottom_passing: false
+  use_collision_priority_multiplier: false
 logging:
   params_to_log:
     - env_runners/episode_reward_mean

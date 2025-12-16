@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import math
@@ -20,6 +21,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
+from ray.rllib.env.env_runner_group import EnvRunnerGroup
+from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
+from ray.rllib.utils.spaces.space_utils import flatten_to_single_ndarray
 
 import matplotlib.pyplot as plt
 
@@ -40,6 +45,28 @@ except ImportError:  # pragma: no cover
 
 LOG_LEVEL = logging.INFO
 logger = logging.getLogger("train")
+
+
+class SuccessCallbacks(DefaultCallbacks):
+    """Track percentage of agents reaching their goal each episode."""
+
+    def on_episode_end(self, worker, base_env, policies, episode, **kwargs):  # type: ignore[override]
+        try:
+            # Single environment instance per rollout worker expected here.
+            sub_envs = base_env.get_sub_environments()  # type: ignore[attr-defined]
+            if not sub_envs:
+                return
+            env = sub_envs[0]
+        except Exception:
+            return
+
+        successes = getattr(env, "successful_agents", None)
+        initial = getattr(env, "initial_agents_num", None)
+        if successes is None or initial is None or initial <= 0:
+            return
+        success_rate = float(successes) / float(initial)
+        # Store as percentage for easier reading in dashboards.
+        episode.custom_metrics["success_rate_pct"] = success_rate * 100.0
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -201,8 +228,12 @@ def build_environment_config(config: TrainConfig, seed: Optional[int] = None) ->
     env_config.setdefault("map_path", str(config.paths.map_root))
     if not env_config.get("maps_names_with_variants"):
         raise ValueError("Config must specify environment.maps_names_with_variants")
-    if seed is not None and env_config.get("seed") is None:
-        env_config["seed"] = seed
+    # For training envs we only fix the seed when the user explicitly
+    # requested one via the environment config itself. Otherwise RLlib
+    # will create env instances with their own RNG streams, improving
+    # diversity across episodes and workers.
+    if env_config.get("seed") is not None:
+        env_config["seed"] = int(env_config["seed"])
     return env_config
 
 
@@ -210,8 +241,10 @@ def build_evaluation_env_config(config: TrainConfig, seed: Optional[int]) -> Dic
     env_config = build_environment_config(config)
     eval_overrides = dict(config.evaluation_environment)
     env_config.update(eval_overrides)
-    if seed is not None and env_config.get("seed") is None:
-        env_config["seed"] = seed
+    # Evaluation keeps a deterministic seed per run unless the user
+    # explicitly overrides it in the evaluation_environment block.
+    if env_config.get("seed") is None and seed is not None:
+        env_config["seed"] = int(seed)
     return env_config
 
 
@@ -222,11 +255,21 @@ def _generate_seed() -> int:
 def resolve_run_seeds(config: TrainConfig) -> Tuple[int, int, bool, bool]:
     explicit_train_seed = config.environment.get("seed")
     original_train_seed = config.training.random_seed
+    # Training seed is kept for reproducibility metadata only. We no
+    # longer push it into env_config unless the user also set
+    # environment.seed explicitly.
     if explicit_train_seed is not None:
-        training_seed = explicit_train_seed
+        training_seed = int(explicit_train_seed)
+        config.training.random_seed = training_seed
     else:
-        training_seed = original_train_seed if original_train_seed is not None else _generate_seed()
-    config.training.random_seed = training_seed
+        training_seed = None
+    # else:
+    #     training_seed = (
+    #         int(original_train_seed)
+    #         if original_train_seed is not None
+    #         else _generate_seed()
+    #     )
+    # config.training.random_seed = training_seed
 
     explicit_eval_seed = config.evaluation_environment.get("seed")
     original_eval_seed = config.training.evaluation_seed
@@ -273,6 +316,23 @@ def prepare_model_config(config: TrainConfig) -> Dict[str, Any]:
             ],
             "fcnet_hiddens": [512, 256],
         })
+    recurrent_cfg = config.model.recurrent
+    if recurrent_cfg.enabled:
+        model_config["use_lstm"] = True
+        if recurrent_cfg.cell_size is not None and "lstm_cell_size" not in model_config:
+            model_config["lstm_cell_size"] = recurrent_cfg.cell_size
+        if recurrent_cfg.max_seq_len is not None and "max_seq_len" not in model_config:
+            model_config["max_seq_len"] = recurrent_cfg.max_seq_len
+        if (
+            recurrent_cfg.use_prev_action is not None
+            and "lstm_use_prev_action" not in model_config
+        ):
+            model_config["lstm_use_prev_action"] = recurrent_cfg.use_prev_action
+        if (
+            recurrent_cfg.use_prev_reward is not None
+            and "lstm_use_prev_reward" not in model_config
+        ):
+            model_config["lstm_use_prev_reward"] = recurrent_cfg.use_prev_reward
     return model_config
 
 
@@ -289,23 +349,26 @@ def _normalise_metric_value(raw_value: Any) -> Optional[Any]:
         return raw_value
 
     if isinstance(raw_value, np.generic):
-        return raw_value.item()
+        raw_value = raw_value.item()
 
     if isinstance(raw_value, numbers.Integral):
         return int(raw_value)
 
     if isinstance(raw_value, numbers.Real):
-        return float(raw_value)
+        value = float(raw_value)
+        return value if math.isfinite(value) else None
 
     if isinstance(raw_value, numbers.Number):
         try:
-            return float(raw_value)
+            value = float(raw_value)
+            return value if math.isfinite(value) else None
         except TypeError:
             return None
 
     if isinstance(raw_value, np.ndarray):
         if raw_value.size == 1:
-            return raw_value.item()
+            scalar = raw_value.item()
+            return _normalise_metric_value(scalar)
         return None
 
     if hasattr(raw_value, "item"):
@@ -313,8 +376,9 @@ def _normalise_metric_value(raw_value: Any) -> Optional[Any]:
             item_value = raw_value.item()
         except Exception:  # pragma: no cover - defensive fallback
             item_value = None
-        if isinstance(item_value, numbers.Number):
-            return item_value
+        if isinstance(item_value, numbers.Real):
+            value = float(item_value)
+            return value if math.isfinite(value) else None
 
     return None
 
@@ -394,6 +458,150 @@ def _sanitize_for_path(value: Optional[str], fallback: str) -> str:
     return safe or fallback
 
 
+def _prepare_video_env_config(
+    base_env_config: Dict[str, Any],
+    videos_root: Path,
+    run_component: str,
+    wandb_group: Optional[str],
+) -> Tuple[Dict[str, Any], Path]:
+    env_config = deepcopy(base_env_config)
+    env_config["render_mode"] = "human"
+
+    render_config = dict(env_config.get("render_config", {}))
+    render_config.setdefault("title", run_component)
+    render_config["save_video"] = True
+    render_config["show_render"] = False
+    render_config["save_frames"] = False
+
+    videos_root.mkdir(parents=True, exist_ok=True)
+    date_dir = videos_root / datetime.now().strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    group_component = _sanitize_for_path(wandb_group, "no-group")
+    folder_name = run_component if wandb_group is None else f"{run_component}_{group_component}"
+    run_dir = date_dir / folder_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    video_path = run_dir / f"{run_component}.mp4"
+    suffix = 1
+    while video_path.exists():
+        video_path = run_dir / f"{run_component}_{suffix}.mp4"
+        suffix += 1
+
+    render_config["video_path"] = str(video_path)
+    render_config.setdefault("video_fps", 10)
+    render_config.setdefault("video_dpi", 300)
+    render_config.setdefault("legend_position", (0, 0))
+    render_config.setdefault("frames_path", str(run_dir / "frames"))
+    render_config.setdefault("render_delay", 0.0)
+    render_config.setdefault("include_legend", True)
+    env_config["render_config"] = render_config
+    return env_config, video_path
+
+
+def evaluate_and_record_video(
+    algorithm: Any,
+    base_env_config: Dict[str, Any],
+    videos_root: Path,
+    run_component: str,
+    wandb_group: Optional[str],
+) -> Tuple[Optional[Path], Optional[int]]:
+    """Run `algorithm.evaluate` with render enabled and return the saved video path."""
+    if algorithm is None:
+        return None, None
+
+    base_eval_config = getattr(algorithm, "evaluation_config", None)
+    if base_eval_config is None:
+        logger.warning("No evaluation config available; skipping video evaluation for %s", run_component)
+        return None, None
+
+    video_env_config, video_path = _prepare_video_env_config(
+        base_env_config,
+        videos_root,
+        run_component,
+        wandb_group,
+    )
+    video_fps = (
+        video_env_config.get("render_config", {}).get("video_fps")
+        if isinstance(video_env_config.get("render_config"), dict)
+        else None
+    )
+
+    eval_config = base_eval_config.copy(copy_frozen=False)
+    eval_config.env_config = video_env_config
+    eval_config.evaluation_num_env_runners = 0
+    try:
+        eval_config.validate()
+        eval_config.freeze()
+    except Exception:
+        logger.exception("Failed to prepare evaluation config for video recording (%s)", run_component)
+        return None, video_fps
+
+    _, env_creator = algorithm._get_env_id_and_creator(eval_config.env, eval_config)
+    video_eval_group: Optional[EnvRunnerGroup] = None
+    original_eval_group = getattr(algorithm, "eval_env_runner_group", None)
+    original_eval_config = getattr(algorithm, "evaluation_config", None)
+
+    def _finalise(env: Any) -> None:
+        writer = getattr(env, "_video_writer", None)
+        if writer is not None:
+            try:
+                writer.finish()
+            except Exception:
+                logger.warning("Unable to finalise video writer for %s", run_component, exc_info=True)
+            try:
+                delattr(env, "_video_writer")
+            except Exception:
+                pass
+        if hasattr(env, "_fig"):
+            try:
+                plt.close(env._fig)
+            except Exception:
+                logger.debug("Failed to close matplotlib figure for %s", run_component, exc_info=True)
+            try:
+                delattr(env, "_fig")
+            except Exception:
+                pass
+
+    try:
+        video_eval_group = EnvRunnerGroup(
+            env_creator=env_creator,
+            validate_env=None,
+            default_policy_class=algorithm.get_default_policy_class(algorithm.config),
+            config=eval_config,
+            num_env_runners=0,
+            logdir=getattr(algorithm, "logdir", None),
+            tune_trial_id=getattr(algorithm, "trial_id", None),
+        )
+
+        algorithm.eval_env_runner_group = video_eval_group
+        algorithm.evaluation_config = eval_config
+
+        try:
+            algorithm.evaluate()
+        except Exception:
+            logger.exception("Failed to run evaluation for video recording (%s)", run_component)
+            return None, video_fps
+
+    finally:
+        if video_eval_group is not None:
+            try:
+                video_eval_group.foreach_env(_finalise)
+            except Exception:
+                logger.debug("Unable to clean up evaluation video environments for %s", run_component, exc_info=True)
+            try:
+                video_eval_group.stop()
+            except Exception:
+                logger.warning("Unable to stop video evaluation env runners for %s", run_component, exc_info=True)
+        algorithm.eval_env_runner_group = original_eval_group
+        algorithm.evaluation_config = original_eval_config
+
+    if not video_path.exists():
+        logger.warning("Video file was not created at %s", video_path)
+        return None, video_fps
+
+    return video_path, video_fps
+
+
 def record_policy_video(
     algorithm: Any,
     base_env_config: Dict[str, Any],
@@ -438,10 +646,38 @@ def record_policy_video(
     env_config["render_config"] = render_config
 
     env = None
+    policy = None
+    policy_id = DEFAULT_POLICY_ID
     try:
+        # For render-only rollouts we do not want to reuse the evaluation seed;
+        # drop it so the video samples a fresh map/layout like the live evals.
+        recording_seed = env_config.pop("seed", None)
         env = RLMAPF(env_config)
-        seed = env_config.get("seed")
-        observations, _ = env.reset(seed=seed)
+        if recording_seed is not None:
+            logger.debug("Record policy video ignoring fixed seed %s to capture varied layouts", recording_seed)
+        observations, _ = env.reset()  # Random seed to avoid repeating the same map
+
+        try:
+            policy = algorithm.get_policy(policy_id)  # type: ignore[attr-defined]
+        except Exception:
+            policy = algorithm.get_policy()  # type: ignore[attr-defined]
+            policy_id = getattr(policy, "policy_id", DEFAULT_POLICY_ID)
+        if policy is None:
+            raise RuntimeError("Unable to retrieve policy for video recording")
+
+        state_init = policy.get_initial_state()
+        use_lstm = len(state_init) > 0
+
+        def _copy_state_template():
+            if not state_init:
+                return []
+            return [np.copy(s) if isinstance(s, np.ndarray) else s for s in state_init]
+
+        action_template = flatten_to_single_ndarray(policy.action_space.sample())  # type: ignore[attr-defined]
+        agent_states: collections.defaultdict[str, List[Any]] = collections.defaultdict(_copy_state_template)
+        prev_actions = collections.defaultdict(lambda: np.copy(action_template))
+        prev_rewards = collections.defaultdict(float)
+
         max_steps = max_render_steps or env_config.get("max_steps") or env.max_steps
         step = 0
         while step < max_steps:
@@ -449,30 +685,29 @@ def record_policy_video(
             # observation structure (avoid passing a multi-agent obs dict directly).
             int_actions: Dict[str, int] = {}
             for agent_id, obs in observations.items():
-                # Default to the single (default) policy used during training.
-                try:
-                    result = algorithm.compute_single_action(obs, explore=False, policy_id="default_policy")  # type: ignore[attr-defined]
-                except TypeError:
-                    # Some RLlib versions don't require/allow policy_id here.
-                    result = algorithm.compute_single_action(obs, explore=False)  # type: ignore[attr-defined]
-                except Exception:
-                    # Fallback to explicit policy API if available.
-                    try:
-                        policy = algorithm.get_policy("default_policy")  # type: ignore[attr-defined]
-                    except Exception:
-                        policy = algorithm.get_policy()  # type: ignore[attr-defined]
-                    result = policy.compute_single_action(obs, explore=False)  # type: ignore[attr-defined]
+                policy_state = agent_states[agent_id]
+                action_result = policy.compute_single_action(  # type: ignore[attr-defined]
+                    obs,
+                    state=policy_state,
+                    prev_action=prev_actions[agent_id],
+                    prev_reward=prev_rewards[agent_id],
+                    explore=False,
+                )
+                action, new_state, _ = action_result
+                if use_lstm:
+                    agent_states[agent_id] = new_state
 
-                # Support both return shapes: action or (action, state_out, info)
-                action = result[0] if isinstance(result, tuple) else result
+                action = flatten_to_single_ndarray(action)
+                prev_actions[agent_id] = action
 
                 # RLlib may return numpy scalars/arrays; normalise to ints for the env.
-                if isinstance(action, tuple):
-                    action = action[0]
                 if isinstance(action, (list, np.ndarray)):
                     action = np.asarray(action).item()
                 int_actions[agent_id] = int(action)
-            observations, _, terminateds, truncateds, _ = env.step(int_actions)
+            observations, rewards, terminateds, truncateds, _ = env.step(int_actions)
+            if isinstance(rewards, dict):
+                for agent_id, reward in rewards.items():
+                    prev_rewards[agent_id] = reward if reward is not None else 0.0
             step += 1
             if terminateds.get("__all__", False) or truncateds.get("__all__", False):
                 break
@@ -598,6 +833,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         .training(model=model_config)
         .env_runners(num_env_runners=rollout_workers)
         .environment(RLMAPF, env_config=env_config)
+        .callbacks(SuccessCallbacks)
     )
 
     if config.training.evaluation_enabled:
@@ -629,6 +865,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     metric_paths = [metric.split("/") for metric in config.logging.params_to_log]
+    success_metric_primary = ["custom_metrics", "success_rate_pct_mean"]
+    success_metric_alt = ["env_runners", "custom_metrics", "success_rate_pct_mean"]
+    if success_metric_primary not in metric_paths:
+        metric_paths.append(success_metric_primary)
+    if success_metric_alt not in metric_paths:
+        metric_paths.append(success_metric_alt)
     evaluation_metric_paths = [["evaluation"] + path for path in metric_paths]
     best_metrics: Dict[str, Dict[str, Any]] = {}
 
@@ -677,7 +919,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         train_metrics.update(eval_metrics)
                         if config.run.use_wandb and wandb_run is not None:
                             eval_run_component = f"{run_name}_eval_ep{episode}"
-                            eval_video_path = record_policy_video(
+                            eval_video_path, eval_video_fps = evaluate_and_record_video(
                                 algorithm,
                                 video_env_config_for_eval,
                                 videos_root,
@@ -686,20 +928,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                             )
                             if eval_video_path is None:
                                 logger.warning("Evaluation video recording failed for episode %s", episode)
+                            else:
+                                wandb_run.log(
+                                    {
+                                        "evaluation/video": wandb.Video(
+                                            str(eval_video_path),
+                                            fps=eval_video_fps or 10,
+                                            format="mp4",
+                                        )
+                                    },
+                                    step=episode,
+                                    commit=False,
+                                )
 
                     if config.run.use_wandb and wandb_run is not None:
                         wandb_payload = dict(train_metrics)
-                        if eval_video_path is not None:
-                            video_fps = (
-                                video_env_config_for_eval.get("render_config", {}).get("video_fps")
-                                if isinstance(video_env_config_for_eval.get("render_config"), dict)
-                                else None
-                            )
-                            wandb_payload["evaluation/video"] = wandb.Video(
-                                str(eval_video_path),
-                                fps=video_fps or 10,
-                                format="mp4",
-                            )
                         wandb_run.log(wandb_payload, step=episode)
 
                     if (
@@ -746,7 +989,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                         wandb_run.summary[f"best/{key}"] = entry["value"]
                         wandb_run.summary[f"best_episode/{key}"] = entry["episode"]
                     if video_output_path is not None:
-                        wandb_run.summary["video/demo"] = str(video_output_path)
+                        video_fps = (
+                            video_env_config_for_eval.get("render_config", {}).get("video_fps")
+                            if isinstance(video_env_config_for_eval.get("render_config"), dict)
+                            else None
+                        )
+                        wandb_run.log(
+                            {
+                                "video/demo": wandb.Video(
+                                    str(video_output_path),
+                                    fps=video_fps or 10,
+                                    format="mp4",
+                                )
+                            },
+                            step=config.training.episodes,
+                        )
+                        wandb_run.summary["video/demo_path"] = str(video_output_path)
             except KeyboardInterrupt:
                 logger.warning("Interrupted by user. Saving latest checkpoint before exit.")
                 if algorithm is not None:

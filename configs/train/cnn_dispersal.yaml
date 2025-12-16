@@ -1,0 +1,104 @@
+run:
+  name_prefix: cnn
+  project: rlmapf_iterative_dstar_dispersal
+  group: cnn_iterative_baseline
+  use_wandb: true
+  tags: [cnn, d_star, iterative, dispersal]
+  notes: ""
+hardware:
+  num_cpus: 4
+  num_gpus: 1
+  num_rollout_workers: 6
+  num_evaluation_workers: 1
+model:
+  framework: torch
+  api_stack:
+    enable_rl_module_and_learner: false
+    enable_env_runner_and_connector_v2: false
+  model:
+    conv_activation: relu
+    conv_filters:
+      - [64, [3, 3], 1]
+      - [64, [3, 3], 1]
+      - [64, [3, 3], 1]
+    fcnet_hiddens: [512, 512, 256]
+  recurrent:
+    enabled: false
+    cell_size: 256
+    max_seq_len: 32
+training:
+  episodes: 500
+  save_interval: 250
+  eval_interval: 5
+  evaluation_duration: 10
+  evaluation_enabled: true
+  random_seed: null
+  evaluation_seed: null
+paths:
+  save_dir: saved_models
+  experiments_root: experiments
+  map_root: maps
+environment:
+  agents_num: 20
+  max_steps: 250
+  reward_closer_to_goal_final: false
+  reward_final_d_star: true
+  use_d_star_lite: true
+  d_star_iterations: 3
+  d_star_congestion_weight: 1.0
+  d_star_path_progress_weight: 0.1
+  use_cnn_observation: true
+  collision_penalty: 0.5
+  step_cost: 0.02
+  wait_cost_multiplier: 2
+  goal_reward: 10
+  observation_type: array
+  penalize_collision: true
+  penalize_waiting: true
+  penalize_steps: false
+  reward_closer_to_goal_each_step: false
+  reward_low_density: false
+  penalize_left_side_bottom_passing: false
+  use_collision_priority_multiplier: true
+  render_mode: none
+  render_delay: 0.01
+  cycle_maps_without_replacement: true
+  shuffle_map_cycle: true
+  maps_names_with_variants:
+    basic1_1-100a-35x35: null
+    basic2_1-100a-35x35: null
+    basic3_1-100a-45x35: null
+    big_empty_1-100a-20x20: null
+    grid_1-100a-20x23: null
+    maze1_1-100a-30x30: null
+    maze2_1-100a-30x30: null
+    maze3_1-100a-30x30: null
+    maze4_1-100a-30x30: null
+    pprai_1-20a-42x39: null
+    warehouse0_1-10a-21x21: null
+evaluation_environment:
+  agents_num: 10
+  max_steps: 250
+  step_cost: 0.015
+  wait_cost_multiplier: 2
+  reward_closer_to_goal_final: true
+  reward_final_d_star: false
+  use_d_star_lite: true
+  d_star_iterations: 3
+  d_star_congestion_weight: 1.0
+  d_star_path_progress_weight: 0.0
+  penalize_left_side_bottom_passing: false
+  use_collision_priority_multiplier: false
+  maps_names_with_variants:
+    slots_10-10a-39x29: null
+logging:
+  params_to_log:
+    - env_runners/episode_reward_mean
+    - env_runners/episode_reward_min
+    - env_runners/episode_reward_max
+    - env_runners/episode_len_mean
+    - info/learner/default_policy/policy_loss
+    - info/learner/default_policy/entropy
+    - info/learner/default_policy/kl_divergence
+  local_metrics_file: metrics.jsonl
+  log_git_info: true

@@ -1,14 +1,8 @@
-# RLMapf2 CNN + modified iterative D* Lite on pprai_1-20a-42x39.json
-# Sweep congestion weights {0.0, 1.0, 2.0} with four random seeds per setting.
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-2 --set run.name_prefix=cnn-iterative-dstar-w2 --set environment.d_star_congestion_weight=2.0 --set evaluation_environment.d_star_congestion_weight=2.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-2 --set run.name_prefix=cnn-iterative-dstar-w2 --set environment.d_star_congestion_weight=2.0 --set evaluation_environment.d_star_congestion_weight=2.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-2 --set run.name_prefix=cnn-iterative-dstar-w2 --set environment.d_star_congestion_weight=2.0 --set evaluation_environment.d_star_congestion_weight=2.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0
-cnn_iterative_dstar_different --set run.group=iter-dstar-weight-priority-2 --set run.name_prefix=cnn-iterative-dstar-w2 --set environment.d_star_congestion_weight=2.0 --set evaluation_environment.d_star_congestion_weight=2.0
+cnn_dispersal --set run.group=weight-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
+cnn_dispersal --set run.group=weight-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0
+cnn_dispersal --set run.group=weight-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
+cnn_dispersal --set run.group=weight-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0
+cnn_dispersal --set run.group=weight-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
+cnn_dispersal --set run.group=weight-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0
+cnn_dispersal --set run.group=weight-0 --set run.name_prefix=cnn-iterative-dstar-w0 --set environment.d_star_congestion_weight=0.0 --set evaluation_environment.d_star_congestion_weight=0.0
+cnn_dispersal --set run.group=weight-1 --set run.name_prefix=cnn-iterative-dstar-w1 --set environment.d_star_congestion_weight=1.0 --set evaluation_environment.d_star_congestion_weight=1.0

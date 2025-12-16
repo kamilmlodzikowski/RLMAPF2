@@ -22,6 +22,7 @@ import numpy as np
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
+from ray.rllib.env.env_runner_group import EnvRunnerGroup
 from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
 from ray.rllib.utils.spaces.space_utils import flatten_to_single_ndarray
 
@@ -457,6 +458,150 @@ def _sanitize_for_path(value: Optional[str], fallback: str) -> str:
     return safe or fallback
 
 
+def _prepare_video_env_config(
+    base_env_config: Dict[str, Any],
+    videos_root: Path,
+    run_component: str,
+    wandb_group: Optional[str],
+) -> Tuple[Dict[str, Any], Path]:
+    env_config = deepcopy(base_env_config)
+    env_config["render_mode"] = "human"
+
+    render_config = dict(env_config.get("render_config", {}))
+    render_config.setdefault("title", run_component)
+    render_config["save_video"] = True
+    render_config["show_render"] = False
+    render_config["save_frames"] = False
+
+    videos_root.mkdir(parents=True, exist_ok=True)
+    date_dir = videos_root / datetime.now().strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    group_component = _sanitize_for_path(wandb_group, "no-group")
+    folder_name = run_component if wandb_group is None else f"{run_component}_{group_component}"
+    run_dir = date_dir / folder_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    video_path = run_dir / f"{run_component}.mp4"
+    suffix = 1
+    while video_path.exists():
+        video_path = run_dir / f"{run_component}_{suffix}.mp4"
+        suffix += 1
+
+    render_config["video_path"] = str(video_path)
+    render_config.setdefault("video_fps", 10)
+    render_config.setdefault("video_dpi", 300)
+    render_config.setdefault("legend_position", (0, 0))
+    render_config.setdefault("frames_path", str(run_dir / "frames"))
+    render_config.setdefault("render_delay", 0.0)
+    render_config.setdefault("include_legend", True)
+    env_config["render_config"] = render_config
+    return env_config, video_path
+
+
+def evaluate_and_record_video(
+    algorithm: Any,
+    base_env_config: Dict[str, Any],
+    videos_root: Path,
+    run_component: str,
+    wandb_group: Optional[str],
+) -> Tuple[Optional[Path], Optional[int]]:
+    """Run `algorithm.evaluate` with render enabled and return the saved video path."""
+    if algorithm is None:
+        return None, None
+
+    base_eval_config = getattr(algorithm, "evaluation_config", None)
+    if base_eval_config is None:
+        logger.warning("No evaluation config available; skipping video evaluation for %s", run_component)
+        return None, None
+
+    video_env_config, video_path = _prepare_video_env_config(
+        base_env_config,
+        videos_root,
+        run_component,
+        wandb_group,
+    )
+    video_fps = (
+        video_env_config.get("render_config", {}).get("video_fps")
+        if isinstance(video_env_config.get("render_config"), dict)
+        else None
+    )
+
+    eval_config = base_eval_config.copy(copy_frozen=False)
+    eval_config.env_config = video_env_config
+    eval_config.evaluation_num_env_runners = 0
+    try:
+        eval_config.validate()
+        eval_config.freeze()
+    except Exception:
+        logger.exception("Failed to prepare evaluation config for video recording (%s)", run_component)
+        return None, video_fps
+
+    _, env_creator = algorithm._get_env_id_and_creator(eval_config.env, eval_config)
+    video_eval_group: Optional[EnvRunnerGroup] = None
+    original_eval_group = getattr(algorithm, "eval_env_runner_group", None)
+    original_eval_config = getattr(algorithm, "evaluation_config", None)
+
+    def _finalise(env: Any) -> None:
+        writer = getattr(env, "_video_writer", None)
+        if writer is not None:
+            try:
+                writer.finish()
+            except Exception:
+                logger.warning("Unable to finalise video writer for %s", run_component, exc_info=True)
+            try:
+                delattr(env, "_video_writer")
+            except Exception:
+                pass
+        if hasattr(env, "_fig"):
+            try:
+                plt.close(env._fig)
+            except Exception:
+                logger.debug("Failed to close matplotlib figure for %s", run_component, exc_info=True)
+            try:
+                delattr(env, "_fig")
+            except Exception:
+                pass
+
+    try:
+        video_eval_group = EnvRunnerGroup(
+            env_creator=env_creator,
+            validate_env=None,
+            default_policy_class=algorithm.get_default_policy_class(algorithm.config),
+            config=eval_config,
+            num_env_runners=0,
+            logdir=getattr(algorithm, "logdir", None),
+            tune_trial_id=getattr(algorithm, "trial_id", None),
+        )
+
+        algorithm.eval_env_runner_group = video_eval_group
+        algorithm.evaluation_config = eval_config
+
+        try:
+            algorithm.evaluate()
+        except Exception:
+            logger.exception("Failed to run evaluation for video recording (%s)", run_component)
+            return None, video_fps
+
+    finally:
+        if video_eval_group is not None:
+            try:
+                video_eval_group.foreach_env(_finalise)
+            except Exception:
+                logger.debug("Unable to clean up evaluation video environments for %s", run_component, exc_info=True)
+            try:
+                video_eval_group.stop()
+            except Exception:
+                logger.warning("Unable to stop video evaluation env runners for %s", run_component, exc_info=True)
+        algorithm.eval_env_runner_group = original_eval_group
+        algorithm.evaluation_config = original_eval_config
+
+    if not video_path.exists():
+        logger.warning("Video file was not created at %s", video_path)
+        return None, video_fps
+
+    return video_path, video_fps
+
+
 def record_policy_video(
     algorithm: Any,
     base_env_config: Dict[str, Any],
@@ -774,7 +919,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         train_metrics.update(eval_metrics)
                         if config.run.use_wandb and wandb_run is not None:
                             eval_run_component = f"{run_name}_eval_ep{episode}"
-                            eval_video_path = record_policy_video(
+                            eval_video_path, eval_video_fps = evaluate_and_record_video(
                                 algorithm,
                                 video_env_config_for_eval,
                                 videos_root,
@@ -784,16 +929,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if eval_video_path is None:
                                 logger.warning("Evaluation video recording failed for episode %s", episode)
                             else:
-                                video_fps = (
-                                    video_env_config_for_eval.get("render_config", {}).get("video_fps")
-                                    if isinstance(video_env_config_for_eval.get("render_config"), dict)
-                                    else None
-                                )
                                 wandb_run.log(
                                     {
                                         "evaluation/video": wandb.Video(
                                             str(eval_video_path),
-                                            fps=video_fps or 10,
+                                            fps=eval_video_fps or 10,
                                             format="mp4",
                                         )
                                     },

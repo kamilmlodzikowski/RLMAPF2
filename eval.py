@@ -209,7 +209,7 @@ def parse_video_agent_selection(selection: Optional[str]) -> Optional[Set[int]]:
 
 
 def resolve_checkpoint_path(checkpoint_arg: str,
-                            experiments_roots: Union[str, Path, Iterable[Union[str, Path]]] = "experiments") -> str:
+                            experiments_roots: Union[str, Path, Iterable[Union[str, Path]]] = ("experiments/train", "experiments")) -> str:
     """
     Resolve checkpoint argument to full path.
 
@@ -224,16 +224,18 @@ def resolve_checkpoint_path(checkpoint_arg: str,
     Returns:
         Full path to checkpoint directory
     """
+    arg_str = str(checkpoint_arg).strip()
+
     # If it's a digit, find the Nth most recent checkpoint
-    if checkpoint_arg.isdigit():
-        n = int(checkpoint_arg)
+    if arg_str.isdigit():
+        n = int(arg_str)
 
         if isinstance(experiments_roots, (str, Path)):
             roots: List[Union[str, Path]] = [experiments_roots]
         else:
             roots = list(experiments_roots)
         if not roots:
-            roots = ["experiments"]
+            roots = ["experiments/train", "experiments"]
 
         checkpoint_dirs: List[Path] = []
         for experiments_root in roots:
@@ -265,8 +267,13 @@ def resolve_checkpoint_path(checkpoint_arg: str,
         logger.info(f"Checkpoint #{n} resolved to: {selected_checkpoint}")
         return str(selected_checkpoint)
 
-    # Otherwise, return the path as-is
-    return checkpoint_arg
+    # Otherwise, treat as explicit path
+    path = Path(arg_str).expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint path not found: {path}")
+    return str(path)
 
 
 def collect_git_info(repo_root: Path) -> Dict[str, Any]:
@@ -404,139 +411,246 @@ def save_metadata(
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
-
-def plot_metric_distributions(detailed_results_path: Path, plots_dir: Path):
-    """Generate box plots showing metric distributions across repeats."""
+def plot_success_and_deadlocks(detailed_results_path: Path, plots_dir: Path) -> None:
+    """Line plots for success and deadlock rates vs agent count."""
     try:
         df = pd.read_csv(detailed_results_path)
-        metrics_to_plot = [
-            ('episode_length_steps', 'Episode Length (steps)'),
-            ('total_reward', 'Total Reward'),
-            ('total_collisions', 'Total Collisions'),
-            ('throughput_steps_per_sec', 'Throughput (steps/s)'),
-            ('collision_agent_agent', 'Agent-Agent Collisions'),
-            ('wait_actions', 'Wait Actions'),
-            ('goal_completion_rate_percent', 'Goal Completion Rate (%)'),
-            ('completion_step_deviation', 'Completion Step Deviation')
-        ]
-        rows = 2
-        cols = 4
-        fig, axes = plt.subplots(rows, cols, figsize=(20, 10))
-        axes = axes.flatten()
-        for idx, (metric, title) in enumerate(metrics_to_plot):
-            if metric in df.columns:
-                data_by_agents = [df[df['agents_num'] == n][metric].dropna().values
-                                  for n in sorted(df['agents_num'].unique())]
-                axes[idx].boxplot(data_by_agents, labels=sorted(df['agents_num'].unique()), patch_artist=True)
-                axes[idx].set_title(title)
-                axes[idx].set_xlabel('Number of Agents')
-                axes[idx].set_ylabel(title)
-                axes[idx].grid(True, alpha=0.3)
-        for extra_ax in axes[len(metrics_to_plot):]:
-            extra_ax.set_visible(False)
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'metric_distributions.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        logger.info("Metric distribution plots saved")
-    except Exception as e:
-        logger.warning(f"Could not generate distribution plots: {e}")
-
-
-def plot_collision_breakdown(detailed_results_path: Path, plots_dir: Path):
-    """Generate stacked bar chart comparing collision types."""
-    try:
-        df = pd.read_csv(detailed_results_path)
-        if 'collision_agent_agent' not in df.columns or 'collision_agent_obstacle' not in df.columns:
-            logger.warning("Collision breakdown columns not found")
+        if 'success' not in df.columns:
+            logger.warning("Success column not found; skipping success plot")
             return
-        summary = df.groupby('agents_num').agg({'collision_agent_agent': 'mean', 'collision_agent_obstacle': 'mean'}).reset_index()
-        fig, ax = plt.subplots(figsize=(12, 6))
-        x = summary['agents_num']
-        ax.bar(x, summary['collision_agent_obstacle'], label='Agent-Obstacle', color='steelblue', alpha=0.8)
-        ax.bar(x, summary['collision_agent_agent'], bottom=summary['collision_agent_obstacle'], label='Agent-Agent', color='coral', alpha=0.8)
-        ax.set_xlabel('Number of Agents')
-        ax.set_ylabel('Average Collisions')
-        ax.set_title('Collision Type Breakdown by Agent Count')
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
+        summary = df.groupby('agents_num').agg(
+            success_rate_percent=('success', lambda s: s.mean() * 100.0),
+            deadlock_rate_percent=('deadlock', lambda s: s.mean() * 100.0 if 'deadlock' in df.columns else np.nan),
+        ).reset_index()
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(summary['agents_num'], summary['success_rate_percent'], marker='o', label='Success rate (%)')
+        if 'deadlock_rate_percent' in summary:
+            ax.plot(summary['agents_num'], summary['deadlock_rate_percent'], marker='s', label='Deadlock rate (%)')
+        ax.set_xlabel('Number of agents')
+        ax.set_ylabel('Rate (%)')
+        title = 'Success and deadlock rates'
+        if repeats_count:
+            title += f" (repeats={repeats_count})"
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
         ax.legend()
-        ax.grid(True, alpha=0.3, axis='y')
         plt.tight_layout()
-        plt.savefig(plots_dir / 'collision_breakdown.png', dpi=300, bbox_inches='tight')
+        plt.savefig(plots_dir / 'success_deadlocks.png', dpi=300, bbox_inches='tight')
         plt.close()
-        logger.info("Collision breakdown plot saved")
-    except Exception as e:
-        logger.warning(f"Could not generate collision breakdown plot: {e}")
+        logger.info("Success/deadlock plot saved")
+    except Exception as exc:
+        logger.warning("Could not generate success/deadlock plot: %s", exc)
 
 
-def plot_success_rate_heatmap(detailed_results_path: Path, plots_dir: Path):
-    """Generate 2D heatmap of goal completion rates."""
+def plot_efficiency(detailed_results_path: Path, plots_dir: Path) -> None:
+    """Efficiency plots: episode length (successful), throughput, path efficiency."""
     try:
         df = pd.read_csv(detailed_results_path)
-        if 'goal_completion_rate_percent' not in df.columns:
-            logger.warning("goal_completion_rate_percent column not found")
-            return
-        pivot = df.pivot_table(values='goal_completion_rate_percent', index='repeat', columns='agents_num', aggfunc='mean')
-        fig, ax = plt.subplots(figsize=(14, 8))
-        im = ax.imshow(pivot.values, cmap='RdYlGn', aspect='auto', vmin=0, vmax=100)
-        ax.set_xticks(np.arange(len(pivot.columns)))
-        ax.set_yticks(np.arange(len(pivot.index)))
-        ax.set_xticklabels(pivot.columns)
-        ax.set_yticklabels(pivot.index)
-        ax.set_xlabel('Number of Agents')
-        ax.set_ylabel('Repeat Number')
-        ax.set_title('Goal Completion Rate Heatmap (%)')
-        cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('Goal Completion Rate (%)', rotation=270, labelpad=20)
-        for i in range(len(pivot.index)):
-            for j in range(len(pivot.columns)):
-                value = pivot.values[i, j]
-                if not np.isnan(value):
-                    ax.text(j, i, f'{value:.0f}', ha='center', va='center',
-                            color='black', fontsize=8)
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'success_rate_heatmap.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        logger.info("Success rate heatmap saved")
-    except Exception as e:
-        logger.warning(f"Could not generate success rate heatmap: {e}")
-
-
-def plot_temporal_progression(detailed_results_path: Path, plots_dir: Path):
-    """Generate line plots with confidence intervals showing metric progression."""
-    try:
-        df = pd.read_csv(detailed_results_path)
-        metrics_to_plot = [
-            ('episode_length_steps', 'Episode Length (steps)'),
-            ('total_collisions', 'Total Collisions'),
-            ('collision_agent_agent', 'Agent-Agent Collisions'),
-            ('total_reward', 'Total Reward'),
-            ('goal_completion_rate_percent', 'Goal Completion Rate (%)'),
-            ('completion_step_deviation', 'Completion Step Deviation')
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
+        metrics = [
+            ('success_episode_length_steps', 'Episode length (successful only)'),
+            ('throughput_steps_per_sec', 'Throughput (steps/s)'),
+            ('path_efficiency', 'Path efficiency (actual/optimal)'),
         ]
-        rows = 3
-        cols = 2
-        fig, axes = plt.subplots(rows, cols, figsize=(18, 18))
-        axes = axes.flatten()
-        for idx, (metric, title) in enumerate(metrics_to_plot):
-            if metric in df.columns:
-                summary = df.groupby('agents_num')[metric].agg(['mean', 'std']).reset_index()
-                x, y_mean, y_std = summary['agents_num'], summary['mean'], summary['std']
-                axes[idx].plot(x, y_mean, marker='o', linewidth=2, markersize=8, label=f'{metric} (mean)')
-                axes[idx].fill_between(x, y_mean - y_std, y_mean + y_std, alpha=0.3, label='±1 std')
-                axes[idx].set_xlabel('Number of Agents')
-                axes[idx].set_ylabel(title)
-                axes[idx].set_title(f'{title} vs Agent Count')
-                axes[idx].legend()
-                axes[idx].grid(True, alpha=0.3)
+        available = [(m, title) for m, title in metrics if m in df.columns and not df[m].isna().all()]
+        if not available:
+            logger.warning("No efficiency metrics available for plotting")
+            return
+        fig, axes = plt.subplots(1, len(available), figsize=(6 * len(available), 5))
+        if len(available) == 1:
+            axes = [axes]
+        for ax, (metric, title) in zip(axes, available):
+            summary = df.groupby('agents_num')[metric].agg(['mean', 'std']).reset_index()
+            ax.plot(summary['agents_num'], summary['mean'], marker='o', label='mean')
+            ax.fill_between(summary['agents_num'], summary['mean'] - summary['std'], summary['mean'] + summary['std'],
+                            alpha=0.25, label='±1 std')
+            ax.set_xlabel('Number of agents')
+            ax.set_ylabel(title)
+            plot_title = title
+            if repeats_count:
+                plot_title += f" (repeats={repeats_count})"
+            ax.set_title(plot_title)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
         plt.tight_layout()
-        plt.savefig(plots_dir / 'temporal_progression.png', dpi=300, bbox_inches='tight')
+        plt.savefig(plots_dir / 'efficiency.png', dpi=300, bbox_inches='tight')
         plt.close()
-        logger.info("Temporal progression plot saved")
-    except Exception as e:
-        logger.warning(f"Could not generate temporal progression plot: {e}")
+        logger.info("Efficiency plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate efficiency plot: %s", exc)
+
+
+def plot_collisions(detailed_results_path: Path, plots_dir: Path) -> None:
+    """Stacked bars for collisions per agent-step split by type."""
+    try:
+        df = pd.read_csv(detailed_results_path)
+        required = {'collision_agent_agent_per_agent_step', 'collision_agent_obstacle_per_agent_step'}
+        if not required.issubset(df.columns):
+            logger.warning("Collision rate columns not found; skipping collision plot")
+            return
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
+        summary = df.groupby('agents_num').agg({
+            'collision_agent_agent_per_agent_step': 'mean',
+            'collision_agent_obstacle_per_agent_step': 'mean',
+        }).reset_index()
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x = summary['agents_num']
+        ao = summary['collision_agent_obstacle_per_agent_step']
+        aa = summary['collision_agent_agent_per_agent_step']
+        ax.bar(x, ao, label='Agent–Obstacle', color='steelblue', alpha=0.85)
+        ax.bar(x, aa, bottom=ao, label='Agent–Agent', color='coral', alpha=0.85)
+        ax.set_xlabel('Number of agents')
+        ax.set_ylabel('Collisions per agent-step')
+        title = 'Safety: collisions by type'
+        if repeats_count:
+            title += f" (repeats={repeats_count})"
+        ax.set_title(title)
+        ax.grid(True, axis='y', alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'collisions.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Collision plot saved")
+    except Exception as exc:
+        logger.warning("Could not generate collision plot: %s", exc)
+
+
+def plot_tradeoffs(summary_path: Path, plots_dir: Path) -> None:
+    """Trade-off plots to judge efficiency vs safety and success."""
+    try:
+        summary = pd.read_csv(summary_path)
+        if summary.empty:
+            logger.warning("Summary CSV empty; skipping trade-off plots")
+            return
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Success vs collisions (color by throughput)
+        if {'success_rate_percent', 'avg_collision_total_per_agent_step', 'avg_throughput_steps_per_sec', 'agents_num'}.issubset(summary.columns):
+            sc = axes[0].scatter(
+                summary['avg_collision_total_per_agent_step'],
+                summary['success_rate_percent'],
+                c=summary['avg_throughput_steps_per_sec'],
+                s=60,
+                cmap='viridis',
+                edgecolors='k',
+            )
+            for _, row in summary.iterrows():
+                axes[0].annotate(int(row['agents_num']),
+                                 (row['avg_collision_total_per_agent_step'], row['success_rate_percent']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[0].set_xlabel('Collisions per agent-step')
+            axes[0].set_ylabel('Success rate (%)')
+            axes[0].set_title('Success vs Collisions\n(color: throughput)')
+            axes[0].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[0])
+            cbar.set_label('Throughput (steps/s)')
+
+        # Success vs success-only length (color by collisions)
+        if {'avg_success_length_steps', 'success_rate_percent', 'avg_collision_total_per_agent_step', 'agents_num'}.issubset(summary.columns):
+            sc = axes[1].scatter(
+                summary['avg_success_length_steps'],
+                summary['success_rate_percent'],
+                c=summary['avg_collision_total_per_agent_step'],
+                s=60,
+                cmap='plasma',
+                edgecolors='k',
+            )
+            for _, row in summary.iterrows():
+                axes[1].annotate(int(row['agents_num']),
+                                 (row['avg_success_length_steps'], row['success_rate_percent']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[1].set_xlabel('Episode length (success only)')
+            axes[1].set_ylabel('Success rate (%)')
+            axes[1].set_title('Success vs Efficiency\n(color: collisions)')
+            axes[1].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[1])
+            cbar.set_label('Collisions per agent-step')
+
+        # Throughput vs collisions (color by success)
+        if {'avg_throughput_steps_per_sec', 'avg_collision_total_per_agent_step', 'success_rate_percent', 'agents_num'}.issubset(summary.columns):
+            sc = axes[2].scatter(
+                summary['avg_throughput_steps_per_sec'],
+                summary['avg_collision_total_per_agent_step'],
+                c=summary['success_rate_percent'],
+                s=60,
+                cmap='coolwarm',
+                edgecolors='k',
+            )
+            for _, row in summary.iterrows():
+                axes[2].annotate(int(row['agents_num']),
+                                 (row['avg_throughput_steps_per_sec'], row['avg_collision_total_per_agent_step']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[2].set_xlabel('Throughput (steps/s)')
+            axes[2].set_ylabel('Collisions per agent-step')
+            axes[2].set_title('Throughput vs Collisions\n(color: success)')
+            axes[2].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[2])
+            cbar.set_label('Success rate (%)')
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'tradeoffs.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Trade-off plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate trade-off plots: %s", exc)
+
+
+def plot_variability(detailed_results_path: Path, plots_dir: Path, sample_counts: Optional[List[int]] = None) -> None:
+    """Boxplots for collisions and length to show spread across repeats at selected agent counts."""
+    try:
+        df = pd.read_csv(detailed_results_path)
+        if 'agents_num' not in df.columns or 'repeat' not in df.columns:
+            logger.warning("agents_num/repeat columns not found; skipping variability plots")
+            return
+        if 'collision_total_per_agent_step' not in df.columns:
+            logger.warning("collision_total_per_agent_step not found; skipping variability plots")
+            return
+        if sample_counts is None:
+            unique_agents = sorted(df['agents_num'].unique())
+            # Pick up to 3 evenly spaced agent counts
+            if len(unique_agents) >= 3:
+                sample_counts = [unique_agents[0], unique_agents[len(unique_agents)//2], unique_agents[-1]]
+            else:
+                sample_counts = unique_agents
+
+        # Filter only selected agent counts present in data
+        sample_counts = [c for c in sample_counts if c in df['agents_num'].unique()]
+        if not sample_counts:
+            logger.warning("No matching agent counts found for variability plots")
+            return
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Collisions per agent-step boxplot
+        collision_data = [df[df['agents_num'] == n]['collision_total_per_agent_step'].dropna() for n in sample_counts]
+        axes[0].boxplot(collision_data, labels=sample_counts, patch_artist=True)
+        axes[0].set_xlabel('Number of agents')
+        axes[0].set_ylabel('Collisions per agent-step')
+        axes[0].set_title('Collision variability across repeats')
+        axes[0].grid(True, axis='y', alpha=0.3)
+
+        # Episode length (success-only) boxplot
+        if 'success_episode_length_steps' in df.columns:
+            length_data = [df[df['agents_num'] == n]['success_episode_length_steps'].dropna() for n in sample_counts]
+            axes[1].boxplot(length_data, labels=sample_counts, patch_artist=True)
+            axes[1].set_xlabel('Number of agents')
+            axes[1].set_ylabel('Episode length (success only)')
+            axes[1].set_title('Length variability across repeats')
+            axes[1].grid(True, axis='y', alpha=0.3)
+        else:
+            axes[1].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'variability.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Variability plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate variability plots: %s", exc)
 
 
 def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
-    """Generate 2×3 grid comparing all metrics across maps."""
+    """Generate 2×3 grid comparing metrics across maps."""
     try:
         dfs = {}
         for label, summary_path in map_summaries.items():
@@ -546,13 +660,12 @@ def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
             logger.warning("Need at least 2 maps for cross-map comparison")
             return
         metrics = [
-            ('avg_length_steps', 'Average Episode Length (steps)'),
-            ('avg_total_collisions', 'Average Collisions'),
-            ('avg_collision_agent_agent', 'Agent-Agent Collisions'),
-            ('avg_throughput_steps_per_sec', 'Average Throughput (steps/s)'),
-            ('avg_goal_completion_rate_percent', 'Goal Completion Rate (%)'),
-            ('avg_reward', 'Average Reward'),
-            ('success_rate_percent', 'Success Rate (%)')
+            ('avg_success_rate_percent', 'Success rate (%)'),
+            ('avg_deadlock_rate_percent', 'Deadlock rate (%)'),
+            ('avg_success_length_steps', 'Episode length (success)'),
+            ('avg_throughput_steps_per_sec', 'Throughput (steps/s)'),
+            ('avg_collision_agent_agent_per_agent_step', 'Agent–Agent collisions/agent-step'),
+            ('avg_collision_agent_obstacle_per_agent_step', 'Agent–Obstacle collisions/agent-step'),
         ]
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         axes = axes.flatten()
@@ -560,7 +673,7 @@ def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
             for map_label, df in dfs.items():
                 if metric in df.columns:
                     axes[idx].plot(df['agents_num'], df[metric], marker='o', linewidth=2, label=map_label)
-            axes[idx].set_xlabel('Number of Agents')
+            axes[idx].set_xlabel('Number of agents')
             axes[idx].set_ylabel(title)
             axes[idx].set_title(title)
             axes[idx].legend()
@@ -568,7 +681,7 @@ def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
         plt.tight_layout()
         plt.savefig(plots_dir / 'cross_map_comparison.png', dpi=300, bbox_inches='tight')
         plt.close()
-        logger.info(f"Cross-map comparison plot saved")
+        logger.info("Cross-map comparison plot saved")
     except Exception as e:
         logger.warning(f"Could not generate cross-map comparison plot: {e}")
 
@@ -779,6 +892,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             goal_completion_rate_results = {}
             avg_steps_to_goal_results = {}
             completion_deviation_results = {}
+            success_flags = {}
+            success_length_results = {}
+            path_efficiency_results = {}
+            collision_agent_agent_rate_results = {}
+            collision_agent_obstacle_rate_results = {}
+            collision_total_rate_results = {}
+            deadlock_flags = {}
             deadlocks = {}
         
             def run_repeat(agents_num: int, repeat: int) -> tuple:
@@ -795,106 +915,57 @@ def main(argv: Optional[List[str]] = None) -> int:
                     video_path = str(results_dir / video_filename)
                     logger.info("Rendering video to: %s", video_path)
             
-                # For video rendering, manually step through environment
+                # Build algorithm once per repeat with non-video env config
+                eval_env_config = configure_env(
+                    config,
+                    agents_num=agents_num,
+                    render_mode="none",
+                    seed=42 + repeat,
+                    render_video=False,
+                )
+                algo_config = algorithm_config_builder.environment(RLMAPF, env_config=eval_env_config)
+                temp_algorithm = algo_config.build()
+                temp_algorithm.restore(CHECKPOINT_PATH)
+                policy = temp_algorithm.get_policy()
+
+                # Optional video rollout using the same policy
                 if should_render:
-                    # Create environment directly with video rendering enabled
-                    env_config_dict = configure_env(
+                    video_env_config = configure_env(
                         config,
                         agents_num=agents_num,
-                        render_mode=None,  # Will be set by configure_env
+                        render_mode=None,  # configure_env sets human for video
                         seed=42 + repeat,
                         render_video=True,
-                        video_path=video_path
+                        video_path=video_path,
                     )
-                
-                    # RLMAPF is already imported at the top of the file
-                    env = RLMAPF(env_config_dict)
-                
-                    # Load policy from checkpoint
-                    temp_algorithm = algorithm_config_builder.build()
-                    temp_algorithm.restore(CHECKPOINT_PATH)
-                    policy = temp_algorithm.get_policy()
-
+                    video_env = RLMAPF(video_env_config)
                     try:
-                        # Run episode manually
-                        start_time = time.time()
-                        obs, info = env.reset()
-                        done = False
-                        step_count = 0
-                        max_steps = env_config_dict['max_steps']
-
-                        while not done and step_count < max_steps:
-                            # Get actions from policy
-                            actions = {}
-                            for agent_id, agent_obs in obs.items():
-                                action = policy.compute_single_action(agent_obs)[0]
-                                actions[agent_id] = action
-                        
-                            # Step environment (render() called automatically inside step())
-                            obs, rewards, dones, truncated, info = env.step(actions)
-                            step_count += 1
-                            done = all(dones.values()) or all(truncated.values())
-
-                        # CRITICAL: Finalize video to save it
-                        env.finalize_video()
-                        env.close()
-
-                        elapsed_time = time.time() - start_time
-                        episode_len = step_count
-
+                        obs, info = video_env.reset()
+                        step_count_video = 0
+                        max_steps_video = video_env_config['max_steps']
+                        while step_count_video < max_steps_video:
+                            actions = {aid: policy.compute_single_action(aobs)[0] for aid, aobs in obs.items()}
+                            obs, rewards, dones, truncated, info = video_env.step(actions)
+                            step_count_video += 1
+                            if all(dones.values()) or all(truncated.values()):
+                                break
+                        video_env.finalize_video()
+                        video_env.close()
                         logger.info("Video saved to: %s", video_path)
-                    finally:
-                        # Cleanup temporary algorithm
-                        temp_algorithm.stop()
-                        del temp_algorithm
-                else:
-                    # Normal evaluation without video using RLlib's evaluate()
-                    eval_config = algorithm_config_builder.environment(
-                        RLMAPF,
-                        env_config=configure_env(
-                            config,
-                            agents_num=agents_num,
-                            render_mode="none",
-                            seed=42 + repeat,
-                            render_video=False
-                        )
-                    )
-                
-                    eval_algorithm = eval_config.build()
-                    eval_algorithm.restore(CHECKPOINT_PATH)
-                
-                    start_time = time.time()
-                    try:
-                        results = eval_algorithm.evaluate()
-                        elapsed_time = time.time() - start_time
-                        episode_len = results['env_runners']['episode_len_mean']
-                    except Exception as e:
-                        logger.error("Error during evaluation: %s", e)
-                        return (agents_num, repeat, None, None, None, None, None, None, None, None, None, None, None)
-                    finally:
-                        eval_algorithm.stop()
-            
-                # Check for deadlock
-                max_steps = env_config.get('max_steps', 250)
-                deadlock = 0 if episode_len < max_steps else 1
-            
-                logger.debug("Completed in %.5fs, steps: %.2f", elapsed_time, episode_len)
-            
+                    except Exception as exc:
+                        logger.warning("Video rendering failed: %s", exc)
 
-                # Always run episodes manually to collect detailed metrics
+                # Manual metrics run using the same policy/algorithm
                 env_config_dict = configure_env(
                     config,
                     agents_num=agents_num,
-                    render_mode=None,
+                    render_mode="none",
                     seed=42 + repeat,
-                    render_video=should_render,
+                    render_video=False,
                     video_path=video_path
                 )
 
                 env = RLMAPF(env_config_dict)
-                temp_algorithm = algorithm_config_builder.build()
-                temp_algorithm.restore(CHECKPOINT_PATH)
-                policy = temp_algorithm.get_policy()
 
                 try:
                     start_time = time.time()
@@ -910,10 +981,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     agent_agent_collision_total = 0
                     agent_obstacle_collision_total = 0
                     prev_positions = {}
-                    total_agents = len(env.agents) if hasattr(env, 'agents') else agents_num
+                    total_agents = env_config_dict.get("agents_num", agents_num)
+                    agent_ids_for_counters = list(getattr(env, "agent_positions", {}).keys()) or list(obs.keys())
                     collision_counters = {
                         agent_id: info.get(agent_id, {}).get("number_of_collisions", 0)
-                        for agent_id in obs.keys()
+                        for agent_id in agent_ids_for_counters
                     }
 
                     while not done and step_count < max_steps:
@@ -993,6 +1065,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 episode_len = step_count
                 wait_actions = sum(1 for action_set in actions_history for action in action_set.values() if action == 4)
                 goal_completion_rate = (len(agents_reached_goal) / total_agents * 100) if total_agents > 0 else 0
+                success = (
+                    episode_len < max_steps
+                    and total_agents > 0
+                    and goal_completion_rate >= 99.9
+                )
                 avg_steps_to_goal = (
                     sum(agent_completion_steps.values()) / len(agent_completion_steps)
                     if agent_completion_steps
@@ -1008,10 +1085,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else:
                     completion_deviation = np.nan
 
+                denom = max(episode_len * total_agents, 1)
+                collision_agent_agent_rate = collision_agent_agent / denom
+                collision_agent_obstacle_rate = collision_agent_obstacle / denom
+                collision_total_rate = total_collisions / denom
+
+                path_efficiency = np.nan
+                if getattr(env, "start_d_star_paths", None) and agent_completion_steps:
+                    efficiencies = []
+                    for agent_id, steps_to_goal in agent_completion_steps.items():
+                        start_path = env.start_d_star_paths.get(agent_id)
+                        if start_path:
+                            optimal_len = max(len(start_path), 1)
+                            efficiencies.append(steps_to_goal / optimal_len)
+                    if efficiencies:
+                        path_efficiency = float(np.mean(efficiencies))
+
+                success_episode_length = episode_len if success else np.nan
+                deadlock = 0 if episode_len < max_steps else 1
+
                 logger.info(
                     "Completed in %.4f s | steps=%d | reward=%.2f | collisions=%d "
                     "(agent-agent=%d, agent-obstacle=%d) | wait actions=%d | "
-                    "goal_rate=%.1f%% | throughput=%.2f steps/s",
+                    "goal_rate=%.1f%% | throughput=%.2f steps/s | success=%s",
                     elapsed_time,
                     episode_len,
                     total_reward,
@@ -1021,11 +1117,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                     wait_actions,
                     goal_completion_rate,
                     throughput,
+                    success,
                 )
 
-                return (agents_num, repeat, elapsed_time, episode_len, total_reward,
-                       total_collisions, collision_agent_agent, collision_agent_obstacle,
-                       throughput, wait_actions, goal_completion_rate, avg_steps_to_goal, completion_deviation)
+                return (
+                    agents_num,
+                    repeat,
+                    elapsed_time,
+                    episode_len,
+                    total_reward,
+                    total_collisions,
+                    collision_agent_agent,
+                    collision_agent_obstacle,
+                    throughput,
+                    wait_actions,
+                    goal_completion_rate,
+                    avg_steps_to_goal,
+                    completion_deviation,
+                    success,
+                    path_efficiency,
+                    collision_agent_agent_rate,
+                    collision_agent_obstacle_rate,
+                    collision_total_rate,
+                    success_episode_length,
+                    deadlock,
+                )
         
             # Run evaluations for each agent count
             for agents_num in AGENTS_RANGE:
@@ -1040,9 +1156,28 @@ def main(argv: Optional[List[str]] = None) -> int:
                     futures = [executor.submit(run_repeat, agents_num, repeat) for repeat in range(REPEATS)]
                 
                     for future in as_completed(futures):
-                        (agents_num_r, repeat_r, elapsed_time, episode_len, reward,
-                         collisions, collision_aa, collision_ao,
-                         throughput, wait_acts, goal_rate, avg_steps, completion_dev) = future.result()
+                        (
+                            agents_num_r,
+                            repeat_r,
+                            elapsed_time,
+                            episode_len,
+                            reward,
+                            collisions,
+                            collision_aa,
+                            collision_ao,
+                            throughput,
+                            wait_acts,
+                            goal_rate,
+                            avg_steps,
+                            completion_dev,
+                            success,
+                            path_eff,
+                            collision_aa_rate,
+                            collision_ao_rate,
+                            collision_total_rate,
+                            success_episode_len,
+                            deadlock_flag,
+                        ) = future.result()
 
                         # Save all results
                         time_results[(agents_num_r, repeat_r)] = elapsed_time
@@ -1056,23 +1191,38 @@ def main(argv: Optional[List[str]] = None) -> int:
                         goal_completion_rate_results[(agents_num_r, repeat_r)] = goal_rate
                         avg_steps_to_goal_results[(agents_num_r, repeat_r)] = avg_steps
                         completion_deviation_results[(agents_num_r, repeat_r)] = completion_dev
-
-                        max_steps = env_config.get('max_steps', 250)
-                        deadlock = 0 if episode_len < max_steps else 1
-                        deadlocks[agents_num_r] += deadlock
+                        success_flags[(agents_num_r, repeat_r)] = success
+                        success_length_results[(agents_num_r, repeat_r)] = success_episode_len
+                        path_efficiency_results[(agents_num_r, repeat_r)] = path_eff
+                        collision_agent_agent_rate_results[(agents_num_r, repeat_r)] = collision_aa_rate
+                        collision_agent_obstacle_rate_results[(agents_num_r, repeat_r)] = collision_ao_rate
+                        collision_total_rate_results[(agents_num_r, repeat_r)] = collision_total_rate
+                        deadlock_flags[(agents_num_r, repeat_r)] = deadlock_flag
+                        deadlocks[agents_num_r] += deadlock_flag
             
                 # Calculate and save intermediate results
                 agent_time_results = [(k, v) for k, v in time_results.items() if k[0] == agents_num]
                 agent_length_results = [(k, v) for k, v in lengths_results.items() if k[0] == agents_num]
+                agent_success_lengths = [(k, v) for k, v in success_length_results.items() if k[0] == agents_num and not np.isnan(v)]
+                agent_success_flags = [(k, v) for k, v in success_flags.items() if k[0] == agents_num]
             
                 if agent_time_results:
                     avg_time = sum(v for _, v in agent_time_results) / len(agent_time_results)
                     avg_length = sum(v for _, v in agent_length_results) / len(agent_length_results)
+                    avg_success_length = (
+                        sum(v for _, v in agent_success_lengths) / len(agent_success_lengths)
+                        if agent_success_lengths else np.nan
+                    )
+                    success_rate = (
+                        sum(1 for _, flag in agent_success_flags if flag) / len(agent_success_flags) * 100
+                        if agent_success_flags else 0
+                    )
                 
                     logger.info("")
                     logger.info("Results for %d agents:", agents_num)
                     logger.info("  Average episode time: %.5f s", avg_time)
                     logger.info("  Average episode length: %.2f steps", avg_length)
+                    logger.info("  Success rate: %.1f%%", success_rate)
                     logger.info("  Deadlocks: %d/%d", deadlocks[agents_num], REPEATS)
                 
                     # Save intermediate results
@@ -1082,11 +1232,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                         f.write(f"Results for {agents_num} agents:\n")
                         f.write(f"Average episode time: {avg_time:.5f} seconds\n")
                         f.write(f"Average episode length: {avg_length:.2f} steps\n")
+                        f.write(f"Average success episode length: {avg_success_length:.2f} steps\n")
+                        f.write(f"Success rate: {success_rate:.1f}%\n")
                         f.write(f"Deadlocks: {deadlocks[agents_num]}/{REPEATS}\n")
                         f.write("\nDetailed results:\n")
                         for (agents_num_r, repeat), elapsed_time in sorted(agent_time_results):
                             episode_len = lengths_results[(agents_num_r, repeat)]
-                            f.write(f"Repeat {repeat}: Time={elapsed_time:.5f}s, Length={episode_len:.2f} steps\n")
+                            success_len = success_length_results.get((agents_num_r, repeat))
+                            f.write(
+                                f"Repeat {repeat}: Time={elapsed_time:.5f}s, Length={episode_len:.2f} steps, "
+                                f"Success_len={success_len if success_len is not None else 'nan'}\n"
+                            )
                 
                     # Save intermediate CSV
                     df_data = []
@@ -1104,7 +1260,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                             'wait_actions': wait_actions_results[(agents_num_r, repeat)],
                             'goal_completion_rate_percent': goal_completion_rate_results[(agents_num_r, repeat)],
                             'average_steps_to_goal': avg_steps_to_goal_results[(agents_num_r, repeat)],
-                            'completion_step_deviation': completion_deviation_results[(agents_num_r, repeat)]
+                            'completion_step_deviation': completion_deviation_results[(agents_num_r, repeat)],
+                            'success': success_flags.get((agents_num_r, repeat), False),
+                            'success_episode_length_steps': success_length_results.get((agents_num_r, repeat)),
+                            'path_efficiency': path_efficiency_results.get((agents_num_r, repeat)),
+                            'collision_agent_agent_per_agent_step': collision_agent_agent_rate_results.get((agents_num_r, repeat)),
+                            'collision_agent_obstacle_per_agent_step': collision_agent_obstacle_rate_results.get((agents_num_r, repeat)),
+                            'collision_total_per_agent_step': collision_total_rate_results.get((agents_num_r, repeat)),
+                            'deadlock': deadlock_flags.get((agents_num_r, repeat), np.nan),
                         })
 
                     df = pd.DataFrame(df_data)
@@ -1133,27 +1296,49 @@ def main(argv: Optional[List[str]] = None) -> int:
                     avg_completion_deviation = np.nanmean([
                         completion_deviation_results[(agents_num, r)] for r in range(REPEATS)
                     ])
+                    avg_success_length = np.nanmean([success_length_results.get((agents_num, r), np.nan) for r in range(REPEATS)])
+                    avg_collision_aa_rate = np.nanmean([collision_agent_agent_rate_results.get((agents_num, r), np.nan) for r in range(REPEATS)])
+                    avg_collision_ao_rate = np.nanmean([collision_agent_obstacle_rate_results.get((agents_num, r), np.nan) for r in range(REPEATS)])
+                    avg_collision_total_rate = np.nanmean([collision_total_rate_results.get((agents_num, r), np.nan) for r in range(REPEATS)])
+                    avg_path_efficiency = np.nanmean([path_efficiency_results.get((agents_num, r), np.nan) for r in range(REPEATS)])
+                    success_rate_percent = (
+                        sum(1 for r in range(REPEATS) if success_flags.get((agents_num, r)))
+                        / REPEATS * 100
+                    )
+                    deadlock_rate_percent = deadlocks[agents_num] / REPEATS * 100
 
                     summary_data.append({
                         'agents_num': agents_num,
                         'avg_time_seconds': avg_time,
                         'avg_length_steps': avg_length,
+                        'avg_success_length_steps': avg_success_length,
                         'avg_reward': avg_reward,
                         'avg_total_collisions': avg_collisions,
                         'avg_collision_agent_agent': avg_collision_aa,
                         'avg_collision_agent_obstacle': avg_collision_ao,
+                        'avg_collision_agent_agent_per_agent_step': avg_collision_aa_rate,
+                        'avg_collision_agent_obstacle_per_agent_step': avg_collision_ao_rate,
+                        'avg_collision_total_per_agent_step': avg_collision_total_rate,
                         'avg_throughput_steps_per_sec': avg_throughput,
                         'avg_wait_actions': avg_wait_actions,
                         'avg_goal_completion_rate_percent': avg_goal_rate,
                         'avg_completion_step_deviation': avg_completion_deviation,
+                        'avg_path_efficiency': avg_path_efficiency,
                         'deadlocks': deadlocks[agents_num],
                         'total_runs': REPEATS,
-                        'success_rate_percent': (REPEATS - deadlocks[agents_num]) / REPEATS * 100
+                        'success_rate_percent': success_rate_percent,
+                        'deadlock_rate_percent': deadlock_rate_percent,
                     })
                 
-                    logger.info("Agents: %2d | Time: %7.5fs | Length: %6.2f steps | Deadlocks: %d/%d (%.1f%% success)",
-                              agents_num, avg_time, avg_length, deadlocks[agents_num], REPEATS,
-                              (REPEATS - deadlocks[agents_num]) / REPEATS * 100)
+                    logger.info(
+                        "Agents: %2d | Time: %7.5fs | Length: %6.2f steps | Success: %.1f%% | Deadlocks: %d/%d",
+                        agents_num,
+                        avg_time,
+                        avg_length,
+                        success_rate_percent,
+                        deadlocks[agents_num],
+                        REPEATS,
+                    )
         
             # Save final summary
             final_name = results_dir / 'final_results'
@@ -1166,8 +1351,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f.write(f"Agents: {item['agents_num']:2d} | ")
                     f.write(f"Time: {item['avg_time_seconds']:7.5f}s | ")
                     f.write(f"Length: {item['avg_length_steps']:6.2f} steps | ")
-                    f.write(f"Deadlocks: {item['deadlocks']}/{item['total_runs']} ")
-                    f.write(f"({item['success_rate_percent']:.1f}% success)\n")
+                    f.write(f"Success: {item['success_rate_percent']:.1f}% | ")
+                    f.write(f"Deadlocks: {item['deadlocks']}/{item['total_runs']}")
+                    f.write(f" ({item['deadlock_rate_percent']:.1f}% deadlock)\n")
             
                 f.write("\n" + "=" * 80 + "\n")
                 f.write("Detailed Results\n")
@@ -1193,7 +1379,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     'wait_actions': wait_actions_results[(agents_num, repeat)],
                     'goal_completion_rate_percent': goal_completion_rate_results[(agents_num, repeat)],
                     'average_steps_to_goal': avg_steps_to_goal_results[(agents_num, repeat)],
-                    'completion_step_deviation': completion_deviation_results[(agents_num, repeat)]
+                    'completion_step_deviation': completion_deviation_results[(agents_num, repeat)],
+                    'success': success_flags.get((agents_num, repeat), False),
+                    'success_episode_length_steps': success_length_results.get((agents_num, repeat)),
+                    'path_efficiency': path_efficiency_results.get((agents_num, repeat)),
+                    'collision_agent_agent_per_agent_step': collision_agent_agent_rate_results.get((agents_num, repeat)),
+                    'collision_agent_obstacle_per_agent_step': collision_agent_obstacle_rate_results.get((agents_num, repeat)),
+                    'collision_total_per_agent_step': collision_total_rate_results.get((agents_num, repeat)),
+                    'deadlock': deadlock_flags.get((agents_num, repeat), np.nan),
                 })
 
             df = pd.DataFrame(df_data)
@@ -1202,6 +1395,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Save summary CSV
             summary_df = pd.DataFrame(summary_data)
             summary_df.to_csv(str(current_results_dir / 'summary.csv'), index=False)
+
+            # Save a compact at-a-glance CSV with headline metrics
+            headline_cols = [
+                'agents_num',
+                'success_rate_percent',
+                'deadlock_rate_percent',
+                'avg_success_length_steps',
+                'avg_throughput_steps_per_sec',
+                'avg_collision_agent_agent_per_agent_step',
+                'avg_collision_agent_obstacle_per_agent_step',
+                'avg_collision_total_per_agent_step',
+                'avg_path_efficiency',
+            ]
+            existing_cols = [c for c in headline_cols if c in summary_df.columns]
+            if existing_cols:
+                summary_df[existing_cols].to_csv(str(current_results_dir / 'at_a_glance.csv'), index=False)
 
             # Store summary path for cross-map comparison
             if multi_map_enabled:
@@ -1218,11 +1427,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             detailed_results_csv = Path(str(final_name) + '.csv')
             if detailed_results_csv.exists():
-                plot_metric_distributions(detailed_results_csv, plots_dir)
-                plot_collision_breakdown(detailed_results_csv, plots_dir)
-                plot_success_rate_heatmap(detailed_results_csv, plots_dir)
-                plot_temporal_progression(detailed_results_csv, plots_dir)
-                logger.info("All plots generated successfully in: %s", plots_dir)
+                plot_success_and_deadlocks(detailed_results_csv, plots_dir)
+                plot_efficiency(detailed_results_csv, plots_dir)
+                plot_collisions(detailed_results_csv, plots_dir)
+                plot_tradeoffs(current_results_dir / 'summary.csv', plots_dir)
+                plot_variability(detailed_results_csv, plots_dir)
+                logger.info("Plots generated in: %s", plots_dir)
             else:
                 logger.warning("Detailed results CSV not found, skipping plotting")
 

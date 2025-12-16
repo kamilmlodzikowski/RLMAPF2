@@ -36,7 +36,7 @@ training:
   evaluation_seed: null
 paths:
   save_dir: saved_models
-  experiments_root: experiments
+  experiments_root: experiments/train
   map_root: maps
 environment:
   agents_num: 20

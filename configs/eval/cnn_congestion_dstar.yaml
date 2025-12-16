@@ -1,10 +1,10 @@
 run:
-  name_prefix: cnn-periphery
-  project: rlmapf_periphery
-  group: cnn-periphery
+  name_prefix: cnn-congestion-dstar
+  project: rlmapf_congestion
+  group: cnn_congestion_spread
   use_wandb: true
-  tags: [evaluation, cnn, periphery]
-  notes: "Evaluation of CNN periphery PPO model"
+  tags: [evaluation, cnn, d_star, congestion]
+  notes: "Eval for congestion-aware D* Lite CNN model (iterations=4, weight=0.5)."
 hardware:
   num_cpus: 4
   num_gpus: 1
@@ -35,7 +35,9 @@ environment:
   max_steps: 250
   reward_closer_to_goal_final: true
   reward_final_d_star: false
-  use_d_star_lite: false
+  use_d_star_lite: true
+  d_star_iterations: 4
+  d_star_congestion_weight: 0.5
   use_cnn_observation: true
   collision_penalty: 0.1
   step_cost: 0.02
@@ -52,10 +54,9 @@ environment:
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:
-    big_empty_1-100a-20x20: null
+    grid_1-100a-20x23: null
 logging:
   log_git_info: true
-# Evaluation settings (custom fields)
 eval_agents_range: "10-20"
 eval_video_fps: 10
 eval_smooth_motion: true

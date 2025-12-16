@@ -55,7 +55,7 @@ environment:
   render_mode: none
   render_delay: 0.01
   maps_names_with_variants:
-    big_empty_1-100a-20x20: null
+    pprai_1-20a-42x39: null
 evaluation_environment:
   max_steps: 200
   step_cost: 0.01

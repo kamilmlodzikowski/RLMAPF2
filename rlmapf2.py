@@ -115,6 +115,10 @@ class RLMAPF(MultiAgentEnv):
                 "render_delay": 0.2,
                 "save_frames": False,
                 "frames_path": "frames/",
+                "smooth_motion": False,
+                "motion_frames": 5,
+                "frame_format": "png",
+                "frame_dpi": 150,
             },
             "d_star_debug": {
                 "save_gif": False,
@@ -374,6 +378,7 @@ class RLMAPF(MultiAgentEnv):
         self.number_of_collisions = {agent: 0 for agent in self._agent_ids}
         self.number_of_steps = {agent: 0 for agent in self._agent_ids}
         self._init_path_styles()
+        self._prev_agent_positions = {}
 
         # Initialize empty agents, agent positions and goal positions
         self.agent_positions = dict()
@@ -462,7 +467,9 @@ class RLMAPF(MultiAgentEnv):
                         show_render=self.render_config["show_render"],
                         render_delay=self.render_config["render_delay"],
                         include_legend=self.render_config["include_legend"],
-                        legend_position=self.render_config["legend_position"])
+                        legend_position=self.render_config["legend_position"],
+                        smooth_motion=self.render_config.get("smooth_motion", False),
+                        motion_frames=self.render_config.get("motion_frames", 5))
 
         return self._get_observations(), self._get_info()
 
@@ -794,7 +801,9 @@ class RLMAPF(MultiAgentEnv):
                         show_render=self.render_config["show_render"],
                         render_delay=self.render_config["render_delay"],
                         include_legend=self.render_config["include_legend"],
-                        legend_position=self.render_config["legend_position"])
+                        legend_position=self.render_config["legend_position"],
+                        smooth_motion=self.render_config.get("smooth_motion", False),
+                        motion_frames=self.render_config.get("motion_frames", 5))
             
 
         return self._get_observations(), self.rewards, terminateds, truncateds, self._get_info()
@@ -1016,7 +1025,9 @@ class RLMAPF(MultiAgentEnv):
                show_render=False, 
                render_delay=0.2, 
                include_legend=True, 
-               legend_position=(0, 0)):
+               legend_position=(0, 0),
+               smooth_motion=False,
+               motion_frames=5):
         """
         Renders the environment state using matplotlib.
         If save_video is True, saves the rendered frames as a video.
@@ -1032,19 +1043,14 @@ class RLMAPF(MultiAgentEnv):
             self._ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
             self._patches = []
             self._texts = []
+            self._prev_agent_positions = {}
 
-        # Set the title
-        self._ax.set_title(title, fontsize=14)
+        if not hasattr(self, "_prev_agent_positions"):
+            self._prev_agent_positions = {}
+        if not self._prev_agent_positions:
+            self._prev_agent_positions = self.agent_positions.copy()
 
-        # Clear previous patches and texts
-        for patch in self._patches:
-            patch.remove()
-        for text in self._texts:
-            text.remove()
-        self._patches.clear()
-        self._texts.clear()
-
-        rendered_paths_info = []
+        frames_to_render = motion_frames if smooth_motion else 1
 
         def _agent_sort_key(agent_id: str) -> int:
             try:
@@ -1052,135 +1058,165 @@ class RLMAPF(MultiAgentEnv):
             except (IndexError, ValueError):
                 return float("inf")
 
-        # Draw obstacles
-        for obst in self.obstacles:
-            rect = Rectangle((obst[0], obst[1]), 1, 1, color="gray")
-            self._ax.add_patch(rect)
-            self._patches.append(rect)
-
-        # Draw all D* Lite paths with per-agent styles (static planned paths preferred)
-        paths_for_render = getattr(self, "d_star_paths", None) or getattr(self, "d_star_planned_paths", None)
-        if self.use_d_star_lite and paths_for_render:
-            path_styles = getattr(self, "_path_styles", {})
-            for agent in sorted(paths_for_render.keys(), key=_agent_sort_key):
-                path = paths_for_render.get(agent, [])
-                if not path:
-                    continue
-                style = path_styles.get(agent, {}) or {}
-                color = style.get("color", "red")
-                linestyle = style.get("linestyle", "--")
-                xs = [pos[0] + 0.5 for pos in path]
-                ys = [pos[1] + 0.5 for pos in path]
-                line, = self._ax.plot(
-                    xs,
-                    ys,
-                    linestyle=linestyle,
-                    linewidth=2,
-                    color=color,
-                    alpha=0.85,
-                    zorder=2,
-                )
-                self._patches.append(line)
-                agent_nr = agent[len("agent_"):] if agent.startswith("agent_") else agent
-                color_hex = style.get("color_hex")
-                if color_hex is None:
-                    try:
-                        color_hex = mcolors.to_hex(color)
-                    except ValueError:
-                        color_hex = "#ff0000"
-                rendered_paths_info.append({
-                    "agent_nr": agent_nr,
-                    "style_label": style.get("style_label", linestyle),
-                    "color_hex": color_hex,
-                })
-
-        # Draw goals
-        for agent, pos in self.goal_positions.items():
-            agent_nr = agent[len("agent_"):]
-            if not self.dones[agent]:
-                rect = Rectangle((pos[0], pos[1]), 1, 1, color="blue")
+        for frame_idx in range(frames_to_render):
+            rendered_paths_info = []
+            if smooth_motion and motion_frames > 1:
+                t = frame_idx / (motion_frames - 1)
             else:
-                rect = Rectangle((pos[0], pos[1]), 1, 1, color="green")
-            self._ax.add_patch(rect)
-            self._patches.append(rect)
-            text_size = 6 if len(agent_nr) > 1 else 8  # Adjust text size for double-digit numbers
-            text = self._ax.text(pos[0] + 0.5, pos[1] + 0.45, agent_nr, color="white", ha="center", va="center", zorder=1, fontsize=text_size)
-            self._texts.append(text)
-        
-        # Draw agents
-        for agent, pos in self.agent_positions.items():
-            agent_nr = agent[len("agent_"):]
-            if not self.dones[agent]:
-                rect = Circle((pos[0] + 0.5, pos[1] + 0.5), 0.4, facecolor="yellow", edgecolor="black")
+                t = 1.0
+
+            self._ax.set_title(title, fontsize=14)
+
+            for patch in self._patches:
+                patch.remove()
+            for text in self._texts:
+                text.remove()
+            self._patches.clear()
+            self._texts.clear()
+
+            for obst in self.obstacles:
+                rect = Rectangle((obst[0], obst[1]), 1, 1, color="gray")
                 self._ax.add_patch(rect)
                 self._patches.append(rect)
-                text_size = 6 if len(agent_nr) > 1 else 8  # Adjust text size for double-digit numbers
-                text = self._ax.text(pos[0] + 0.5, pos[1] + 0.45, agent_nr, color="black", ha="center", va="center", fontsize=text_size)
+
+            paths_for_render = getattr(self, "d_star_paths", None) or getattr(self, "d_star_planned_paths", None)
+            if self.use_d_star_lite and paths_for_render:
+                path_styles = getattr(self, "_path_styles", {})
+                for agent in sorted(paths_for_render.keys(), key=_agent_sort_key):
+                    path = paths_for_render.get(agent, [])
+                    if not path:
+                        continue
+                    style = path_styles.get(agent, {}) or {}
+                    color = style.get("color", "red")
+                    linestyle = style.get("linestyle", "--")
+                    xs = [pos[0] + 0.5 for pos in path]
+                    ys = [pos[1] + 0.5 for pos in path]
+                    line, = self._ax.plot(
+                        xs,
+                        ys,
+                        linestyle=linestyle,
+                        linewidth=2,
+                        color=color,
+                        alpha=0.85,
+                        zorder=2,
+                    )
+                    self._patches.append(line)
+                    agent_nr = agent[len("agent_"):] if agent.startswith("agent_") else agent
+                    color_hex = style.get("color_hex")
+                    if color_hex is None:
+                        try:
+                            color_hex = mcolors.to_hex(color)
+                        except ValueError:
+                            color_hex = "#ff0000"
+                    rendered_paths_info.append({
+                        "agent_nr": agent_nr,
+                        "style_label": style.get("style_label", linestyle),
+                        "color_hex": color_hex,
+                    })
+
+            for agent, pos in self.goal_positions.items():
+                agent_nr = agent[len("agent_"):]
+                if not self.dones[agent]:
+                    rect = Rectangle((pos[0], pos[1]), 1, 1, color="blue")
+                else:
+                    rect = Rectangle((pos[0], pos[1]), 1, 1, color="green")
+                self._ax.add_patch(rect)
+                self._patches.append(rect)
+                text_size = 6 if len(agent_nr) > 1 else 8
+                text = self._ax.text(pos[0] + 0.5, pos[1] + 0.45, agent_nr, color="white", 
+                                ha="center", va="center", zorder=1, fontsize=text_size)
                 self._texts.append(text)
-                    
+            
+            for agent, new_pos in self.agent_positions.items():
+                agent_nr = agent[len("agent_"):]
+                if not self.dones[agent]:
+                    old_pos = self._prev_agent_positions.get(agent, new_pos)
+                    interp_x = old_pos[0] + (new_pos[0] - old_pos[0]) * t
+                    interp_y = old_pos[1] + (new_pos[1] - old_pos[1]) * t
+                    rect = Circle((interp_x + 0.5, interp_y + 0.5), 0.4, facecolor="yellow", edgecolor="black")
+                    self._ax.add_patch(rect)
+                    self._patches.append(rect)
+                    text_size = 6 if len(agent_nr) > 1 else 8
+                    text = self._ax.text(interp_x + 0.5, interp_y + 0.45, agent_nr, color="black", 
+                                    ha="center", va="center", fontsize=text_size)
+                    self._texts.append(text)
 
-        # Add legend
-        legend_lines = [
-            "Legend:",
-            "Yellow: Robot",
-            "Blue: Goal",
-            "Green: Reached Goal",
-            "Gray: Obstacle",
-        ]
-        if rendered_paths_info:
-            legend_lines.append("D* paths (color/style):")
-            for info in rendered_paths_info:
-                legend_lines.append(f"Agent {info['agent_nr']}: {info['color_hex']} {info['style_label']}")
-        legend_text = "\n".join(legend_lines)
-        if include_legend:
-            if hasattr(self, "_legend_text_obj"):
-                self._legend_text_obj.set_text(legend_text)
+            legend_lines = [
+                "Legend:",
+                "Yellow: Robot",
+                "Blue: Goal",
+                "Green: Reached Goal",
+                "Gray: Obstacle",
+            ]
+            if rendered_paths_info:
+                legend_lines.append("D* paths (color/style):")
+                for info in rendered_paths_info:
+                    legend_lines.append(f"Agent {info['agent_nr']}: {info['color_hex']} {info['style_label']}")
+            legend_text = "\n".join(legend_lines)
+            if include_legend:
+                if hasattr(self, "_legend_text_obj"):
+                    self._legend_text_obj.set_text(legend_text)
+                else:
+                    self._legend_text_obj = self._ax.text(
+                        legend_position[0],
+                        self.grid_size[1] + legend_position[1],
+                        legend_text,
+                        fontsize=10,
+                        va="top",
+                        ha="left",
+                        bbox=dict(facecolor='white', alpha=0.5, edgecolor='black'),
+                    )
+            elif hasattr(self, "_legend_text_obj"):
+                self._legend_text_obj.remove()
+                del self._legend_text_obj
+
+            step_text = f"Step: {self.steps}"
+            text_offset = len(step_text) * 0.3
+            if hasattr(self, "_step_text_obj"):
+                self._step_text_obj.set_text(step_text)
+                self._step_text_obj.set_position((self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3))
             else:
-                self._legend_text_obj = self._ax.text(
-                    legend_position[0],
-                    self.grid_size[1] + legend_position[1],
-                    legend_text,
-                    fontsize=10,
-                    va="top",
-                    ha="left",
-                    bbox=dict(facecolor='white', alpha=0.5, edgecolor='black'),
-                )
-        elif hasattr(self, "_legend_text_obj"):
-            self._legend_text_obj.remove()
-            del self._legend_text_obj
+                self._step_text_obj = self._ax.text(self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3, 
+                                                step_text, fontsize=10, va="top")
 
-        # Add step number
-        step_text = f"Step: {self.steps}"
-        text_offset = len(step_text) * 0.3  # Adjust offset based on text length
-        if hasattr(self, "_step_text_obj"):
-            self._step_text_obj.set_text(step_text)
-            self._step_text_obj.set_position((self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3))
-        else:
-            self._step_text_obj = self._ax.text(self.grid_size[0] + 3 - text_offset, self.grid_size[1] + 3, step_text, fontsize=10, va="top")
+            if show_render:
+                plt.draw()
+                plt.pause(render_delay / frames_to_render)
 
-        # Update the plot
-        if show_render:
-            plt.draw()
-            plt.pause(render_delay)
+            if save_frames:
+                if not os.path.exists(frames_path):
+                    os.makedirs(frames_path)
+                if smooth_motion:
+                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}_frame_{frame_idx:02d}")
+                else:
+                    frame_path = os.path.join(frames_path, f"step_{self.steps:04d}")
+                frame_format = self.render_config.get("frame_format", "png")
+                frame_dpi = self.render_config.get("frame_dpi", 150)
+                frame_path_with_ext = f"{frame_path}.{frame_format}"
+                plt.savefig(frame_path_with_ext, format=frame_format, bbox_inches="tight", dpi=frame_dpi)
 
-        # Save frames if enabled
-        if save_frames:
-            if not os.path.exists(frames_path):
-                os.makedirs(frames_path)
-            frame_path = os.path.join(frames_path, f"frame_{self.steps}.svg")
-            plt.savefig(frame_path, format="svg", bbox_inches="tight", dpi=300)
+            if save_video:
+                if not hasattr(self, "_video_writer"):
+                    fps = int(self.render_config.get("video_fps", 10))
+                    if smooth_motion:
+                        fps = fps * motion_frames
+                    self._video_writer = FFMpegWriter(fps=fps, metadata=dict(artist='RLMAPF2 Sim'), bitrate=1800)
+                    self._video_writer.setup(self._fig, video_path, dpi=self.render_config["video_dpi"])
+                self._video_writer.grab_frame()
 
-        # Save video if enabled
-        if save_video:
-            if not hasattr(self, "_video_writer"):
-                fps = int(self.render_config.get("video_fps", 10))
-                self._video_writer = FFMpegWriter(fps=fps, metadata=dict(artist='RLMAPF2 Sim'), bitrate=1800)
-                self._video_writer.setup(self._fig, video_path, dpi=self.render_config["video_dpi"])
-            self._video_writer.grab_frame()
+            if clear and frame_idx == frames_to_render - 1:
+                self._ax.cla()
 
-        # Clear the output if needed
-        if clear:
-            self._ax.cla()
+        self._prev_agent_positions = self.agent_positions.copy()
+
+    def finalize_video(self):
+        """
+        Finalizes and closes the video file.
+        Call this at the end of your episode.
+        """
+        if hasattr(self, "_video_writer"):
+            self._video_writer.finish()
+            del self._video_writer
 
     def _maybe_capture_d_star_step_frame(self, is_reset: bool) -> None:
         """

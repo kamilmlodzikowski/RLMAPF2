@@ -932,6 +932,7 @@ class RLMAPF(MultiAgentEnv):
                 d_star_path_arrays[agent] = array
 
             others_d_star_path_arrays = {agent: np.zeros((self.observation_size, self.observation_size), dtype=float) for agent in self._agent_ids}
+            current_positions = {agent: tuple(pos) for agent, pos in self.agent_positions.items()}
             for agent in self._agent_ids:
                 if agent not in self._agent_ids:
                     continue
@@ -944,6 +945,10 @@ class RLMAPF(MultiAgentEnv):
                                 array[pos] = i
                             elif array[pos] > i:
                                 array[pos] = i
+                        # Always mark the other agent's current position so it is visible even off-path.
+                        pos_current = current_positions.get(agent2)
+                        if pos_current is not None:
+                            array[pos_current] = 1
                 
                 # Crop d_star_path_arrays to observation_size around agent
                 x, y = self.agent_positions[agent]

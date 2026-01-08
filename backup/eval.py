@@ -1,331 +1,1979 @@
-import ray
-import torch
-from ray import tune, train
-from ray.rllib.algorithms.ppo import PPOConfig
-from ray.tune.logger import pretty_print
-from rlmapf2 import RLMAPF
-from ray.tune.stopper import TrialPlateauStopper, MaximumIterationStopper, CombinedStopper
-from ray.air.integrations.wandb import WandbLoggerCallback
-from ray.tune.schedulers import PopulationBasedTraining
-import numpy as np
+#!/usr/bin/env python3
+"""Evaluate trained PPO agents for RLMAPF with structured experiment configs."""
+from __future__ import annotations
+
+import argparse
+import json
 import logging
-import sys
-import wandb
-import time
-from ray.rllib.algorithms.algorithm import Algorithm
 import os
+import subprocess
+import sys
 import time
+import warnings
+from collections import defaultdict
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+import re
+
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import ray
+try:  # Ray versions prior to 2.7 don't expose this symbol
+    from ray._private.utils import RayDeprecationWarning  # type: ignore
+except ImportError:  # pragma: no cover - fallback for older Ray releases
+    class RayDeprecationWarning(DeprecationWarning):
+        pass
+import yaml
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.utils.spaces.space_utils import flatten_to_single_ndarray
+
+from rlmapf2 import RLMAPF
 
 # Ignore deprecation warnings
 os.environ["PYTHONWARNINGS"] = "ignore::DeprecationWarning"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=RayDeprecationWarning)
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+ACTION_DELTAS = {
+    0: (0, -1),  # Up
+    1: (0, 1),   # Down
+    2: (-1, 0),  # Left
+    3: (1, 0),   # Right
+    4: (0, 0),   # Wait
+}
 
-# Config
-NUM_CPUS = 2  # Number of CPU cores available
-NUM_GPUS = 0  # Number of GPUs available
-CHECKPOINT_PATH = "/home/kamil/Documents/RLMAPF/saved_models/model_run_687_30-06-2025_11-53-05_final"
-USE_D_STAR_LITE = False  # Use D* Lite algorithm
+LOG_LEVEL = logging.INFO
+logger = logging.getLogger("eval")
 
-# Environment setup
-AGENTS_NUM = 20
-OBSERVATION_TYPE = 'array'
-EVAL_EPISODES = 1
-REPEATS = 1
 
-EVAL_SEEDS = [a for a in range(42, 42 + EVAL_EPISODES)]
+@dataclass(frozen=True)
+class MapSpec:
+    name: str
+    variants: Optional[List[int]]
+    label: str
 
-def configure_env(agents_num=20, maps_names_with_variants=None, max_steps=250, 
-                      reward_closer_to_goal_final=True, reward_final_d_star=False, 
-                      use_d_star_lite=False, render_mode="none", render_delay=0.01, seed=42):
-        """Configure the default environment with passed parameters."""
-        return {
-            "agents_num": agents_num,
-            "render_mode": render_mode,
-            "render_delay": render_delay,
-            "seed": seed,
-            "map_path": "/home/kamil/Documents/RLMAPF2/maps",
-            "maps_names_with_variants": maps_names_with_variants or {
-                "pprai_1-20a-42x39": None,
-            },
-            "max_steps": max_steps,
-            "collision_penalty": 0.1,
-            "step_cost": 0.02,
-            "wait_cost_multiplier": 2,
-            "goal_reward": 10,
-            "observation_type": OBSERVATION_TYPE,
-            "penalize_collision": True,
-            "penalize_waiting": True,
-            "penalize_steps": True,
-            "reward_closer_to_goal_each_step": False,
-            "reward_closer_to_goal_final": reward_closer_to_goal_final,
-            "reward_final_d_star": reward_final_d_star,
-            "reward_low_density": False,
-            "use_d_star_lite": use_d_star_lite,
-            "render_config": {
-                "show_render": False,
-                "save_video": True,
-                "include_legend": True,
-                "legend_position": (0, 0),
-                "video_path": "render.mp4",
-                "video_fps": 10,
-                "video_dpi": 300,
-                "render_delay": 0.2,
-                "title": "RLMAPF Evaluation" + (" (D*)" if use_d_star_lite else " (no D*)"),
-                "save_frames": False,
-                "frames_path": "frames/",
-            },
-        }
 
-try:
+@dataclass(frozen=True)
+class RunInfo:
+    path: Path
+    name: str
+    name_prefix: Optional[str]
+    start_time: float
 
-    # Create the algorithm
-    # algorithm = Algorithm.from_checkpoint(CHECKPOINT_PATH)
 
-    new_algorithm_config = (
-        PPOConfig()
-        .api_stack(
-            enable_rl_module_and_learner=False,
-            enable_env_runner_and_connector_v2=False
+@dataclass(frozen=True)
+class CheckpointRecord:
+    path: Path
+    episode: Optional[int]
+    timestamp: float
+
+
+@dataclass
+class EpisodeResult:
+    agents_num: int
+    repeat: int
+    episode_runtime_seconds: float
+    episode_length_steps: int
+    total_reward: float
+    total_collisions: int
+    collision_agent_agent: int
+    collision_agent_obstacle: int
+    throughput_steps_per_sec: float
+    wait_actions: int
+    goal_completion_rate_percent: float
+    average_steps_to_goal: float
+    completion_step_deviation: float
+    success: bool
+    path_efficiency: float
+    collision_agent_agent_per_agent_step: float
+    collision_agent_obstacle_per_agent_step: float
+    collision_total_per_agent_step: float
+    success_episode_length_steps: float
+    deadlock: int
+
+
+class EnvConfigBuilder:
+    """Build env configs for evaluation rollouts and videos."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self._config = config
+        self._base_env = dict(config.get('environment', {}))
+        self._paths = dict(config.get('paths', {}))
+
+    def build(
+        self,
+        agents_num: int,
+        seed: int,
+        render_video: bool,
+        video_path: Optional[str],
+        render_mode: Optional[str],
+        map_spec: Optional[MapSpec],
+    ) -> Dict[str, Any]:
+        env_config = dict(self._base_env)
+
+        if map_spec is not None:
+            env_config['maps_names_with_variants'] = {map_spec.name: map_spec.variants}
+
+        env_config['agents_num'] = agents_num
+        env_config['seed'] = seed
+
+        map_root = self._paths.get('map_root', 'maps')
+        if not os.path.isabs(map_root):
+            map_root = os.path.join(os.getcwd(), map_root)
+        env_config['map_path'] = map_root
+
+        if render_video:
+            render_mode = "human"
+        else:
+            render_mode = render_mode if render_mode is not None else env_config.get('render_mode', 'none')
+        env_config['render_mode'] = render_mode
+
+        if video_path is None:
+            video_path = f"evaluation_video_{agents_num}agents.mp4"
+
+        render_config = dict(env_config.get('render_config', {}))
+        render_config.update({
+            "show_render": False,
+            "save_video": render_video,
+            "include_legend": True,
+            "legend_position": (0, 0),
+            "video_path": video_path,
+            "video_fps": self._config.get('eval_video_fps', 10),
+            "video_dpi": 300,
+            "render_delay": 0.2,
+            "title": (
+                f"RLMAPF Evaluation - {agents_num} agents"
+                + (" (D*)" if env_config.get('use_d_star_lite', False) else "")
+            ),
+            "save_frames": False,
+            "frames_path": "frames/",
+            "smooth_motion": self._config.get('eval_smooth_motion', False),
+            "motion_frames": self._config.get('eval_motion_frames', 5),
+        })
+        env_config['render_config'] = render_config
+        return env_config
+
+
+class AlgorithmFactory:
+    """Create PPO algorithms for evaluation with consistent model settings."""
+
+    def __init__(self, model_config: Dict[str, Any], num_gpus: float):
+        self._model_config = model_config
+        self._num_gpus = num_gpus
+
+    def build(self, env_config: Dict[str, Any]) -> Any:
+        config = (
+            PPOConfig()
+            .api_stack(
+                enable_rl_module_and_learner=self._model_config['api_stack'].get('enable_rl_module_and_learner', False),
+                enable_env_runner_and_connector_v2=self._model_config['api_stack'].get('enable_env_runner_and_connector_v2', False),
+            )
+            .framework(self._model_config.get('framework', 'torch'))
+            .training(model=self._model_config.get('model', {}))
+            .environment(RLMAPF, env_config=env_config)
+            .resources(num_gpus=self._num_gpus)
         )
-        .framework("torch")
-        .training(
-            model={
-                "fcnet_hiddens": [1024, 512, 512],
-                "fcnet_activation": "relu", 
-            },
+        return config.build()
+
+
+class PolicyController:
+    """Manage per-agent policy state and action selection."""
+
+    def __init__(self, policy: Any, explore: bool = False):
+        self._policy = policy
+        self._explore = explore
+        self._state_init = policy.get_initial_state()
+        self._use_state = len(self._state_init) > 0
+        self._action_template = flatten_to_single_ndarray(policy.action_space.sample())
+        self._agent_states = defaultdict(self._copy_state_template)
+        self._prev_actions = defaultdict(lambda: np.copy(self._action_template))
+        self._prev_rewards = defaultdict(float)
+
+    def _copy_state_template(self) -> List[Any]:
+        if not self._state_init:
+            return []
+        return [np.copy(s) if isinstance(s, np.ndarray) else s for s in self._state_init]
+
+    def act(self, agent_id: str, obs: Any) -> int:
+        if self._use_state:
+            result = self._policy.compute_single_action(
+                obs,
+                state=self._agent_states[agent_id],
+                prev_action=self._prev_actions[agent_id],
+                prev_reward=self._prev_rewards[agent_id],
+                explore=self._explore,
+            )
+            if isinstance(result, tuple):
+                action = result[0]
+                new_state = result[1] if len(result) > 1 else []
+            else:
+                action = result
+                new_state = []
+            self._agent_states[agent_id] = new_state
+        else:
+            result = self._policy.compute_single_action(obs, explore=self._explore)
+            action = result[0] if isinstance(result, tuple) else result
+
+        action = flatten_to_single_ndarray(action)
+        self._prev_actions[agent_id] = action
+
+        if isinstance(action, (list, np.ndarray)):
+            action = np.asarray(action).item()
+        return int(action)
+
+    def update_reward(self, agent_id: str, reward: float) -> None:
+        self._prev_rewards[agent_id] = reward
+
+
+class ResultsTracker:
+    def __init__(self) -> None:
+        self._results: List[EpisodeResult] = []
+
+    def add(self, result: EpisodeResult) -> None:
+        self._results.append(result)
+
+    def dataframe(self) -> pd.DataFrame:
+        if not self._results:
+            return pd.DataFrame()
+        return pd.DataFrame([result.__dict__ for result in self._results])
+
+    def agent_dataframe(self, agents_num: int) -> pd.DataFrame:
+        df = self.dataframe()
+        if df.empty:
+            return df
+        return df[df['agents_num'] == agents_num].copy()
+
+    def summary_dataframe(self) -> pd.DataFrame:
+        df = self.dataframe()
+        if df.empty:
+            return df
+        grouped = df.groupby('agents_num')
+        summary = grouped.agg({
+            'episode_runtime_seconds': 'mean',
+            'episode_length_steps': 'mean',
+            'success_episode_length_steps': 'mean',
+            'total_reward': 'mean',
+            'total_collisions': 'mean',
+            'collision_agent_agent': 'mean',
+            'collision_agent_obstacle': 'mean',
+            'collision_agent_agent_per_agent_step': 'mean',
+            'collision_agent_obstacle_per_agent_step': 'mean',
+            'collision_total_per_agent_step': 'mean',
+            'throughput_steps_per_sec': 'mean',
+            'wait_actions': 'mean',
+            'goal_completion_rate_percent': 'mean',
+            'completion_step_deviation': 'mean',
+            'path_efficiency': 'mean',
+            'deadlock': 'sum',
+            'success': 'mean',
+        }).reset_index()
+
+        summary = summary.rename(columns={
+            'episode_runtime_seconds': 'avg_time_seconds',
+            'episode_length_steps': 'avg_length_steps',
+            'success_episode_length_steps': 'avg_success_length_steps',
+            'total_reward': 'avg_reward',
+            'total_collisions': 'avg_total_collisions',
+            'collision_agent_agent': 'avg_collision_agent_agent',
+            'collision_agent_obstacle': 'avg_collision_agent_obstacle',
+            'collision_agent_agent_per_agent_step': 'avg_collision_agent_agent_per_agent_step',
+            'collision_agent_obstacle_per_agent_step': 'avg_collision_agent_obstacle_per_agent_step',
+            'collision_total_per_agent_step': 'avg_collision_total_per_agent_step',
+            'throughput_steps_per_sec': 'avg_throughput_steps_per_sec',
+            'wait_actions': 'avg_wait_actions',
+            'goal_completion_rate_percent': 'avg_goal_completion_rate_percent',
+            'completion_step_deviation': 'avg_completion_step_deviation',
+            'path_efficiency': 'avg_path_efficiency',
+            'deadlock': 'deadlocks',
+            'success': 'success_rate_percent',
+        })
+
+        summary['success_rate_percent'] = summary['success_rate_percent'] * 100.0
+        summary['deadlock_rate_percent'] = (
+            summary['deadlocks'] / grouped.size().values * 100.0
         )
-        .environment(RLMAPF, env_config=configure_env(
-            agents_num=AGENTS_NUM,
-            maps_names_with_variants={
-                "pprai_1-20a-42x39": None,
-            },
-            max_steps=200,
-            reward_closer_to_goal_final=True,
-            reward_final_d_star=False,
-            use_d_star_lite=USE_D_STAR_LITE,
-        ))
-        .evaluation(
-            evaluation_interval=1,
-            evaluation_duration=1,
-            # evaluation_force_reset_envs_before_iteration=True,
-            evaluation_config={"env_config": 
-                configure_env(
-                    agents_num=AGENTS_NUM,
-                    maps_names_with_variants={
-                        "pprai_1-20a-42x39": None,
-                    },
-                    max_steps=200,
-                    reward_closer_to_goal_final=True,
-                    reward_final_d_star=False,
-                    use_d_star_lite=USE_D_STAR_LITE,
-                    render_mode="none",
+        summary['total_runs'] = grouped.size().values
+        return summary
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Evaluate trained PPO agents for RLMAPF.")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Config name (relative to configs/eval) or explicit path to YAML file.",
+    )
+    parser.add_argument(
+        "--config-dir",
+        default=None,
+        help="Base directory for config lookup when --config is a name (default: configs/eval).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Checkpoint number (1=most recent, 2=second most recent, etc.) or full path to checkpoint directory.",
+    )
+    parser.add_argument(
+        "--checkpoint-group",
+        default=None,
+        help=(
+            "Run directory or run name prefix to group checkpoints (e.g. cnn-20260103-..., or cnn). "
+            "When set, numeric --checkpoint selects the Nth most recent run in this group."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-strategy",
+        choices=["best", "latest", "oldest"],
+        default=None,
+        help="How to choose a checkpoint inside a run group when --checkpoint is numeric.",
+    )
+    parser.add_argument(
+        "--checkpoint-success-tolerance",
+        type=float,
+        default=None,
+        help=(
+            "Tolerance in success-rate points when selecting the best checkpoint. "
+            "If multiple checkpoints are within this range, pick the oldest."
+        ),
+    )
+    parser.add_argument(
+        "--sync-train-config",
+        action="store_true",
+        help=(
+            "Load the training config stored next to the checkpoint and overwrite "
+            "evaluation environment/model settings to match training."
+        ),
+    )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override config values, e.g. --set eval_agents_range=10-15.",
+    )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=None,
+        help="Number of threads for parallel evaluation (default: from config or 1).",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=None,
+        help="Number of repeats for each agent count (default: from config or 10).",
+    )
+    parser.add_argument(
+        "--results-dir",
+        default=None,
+        help="Custom directory to save results (default: auto-generated with timestamp).",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Custom run name for results folder.",
+    )
+    parser.add_argument(
+        "--render-video",
+        action="store_true",
+        help="Enable video rendering for evaluation episodes.",
+    )
+    parser.add_argument(
+        "--video-agents",
+        type=str,
+        default=None,
+        help="Comma-separated list or ranges of agent counts to render (e.g. '8,16,32-36').",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_config_path(name: str, config_dir: Optional[str], repo_root: Path) -> Path:
+    """Resolve config file path from name or explicit path."""
+    candidate = Path(name)
+    if candidate.is_file():
+        return candidate.resolve()
+
+    search_dirs = []
+    if config_dir:
+        search_dirs.append(Path(config_dir))
+    search_dirs.append(repo_root / "configs" / "eval")
+
+    for base in search_dirs:
+        with_suffix = name if name.endswith(".yaml") else f"{name}.yaml"
+        path = (base / with_suffix).resolve()
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"Unable to locate config '{name}'. Looked in: {search_dirs}")
+
+
+def load_config(config_path: Path) -> Dict[str, Any]:
+    """Load configuration from YAML file."""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def apply_overrides(config: Dict[str, Any], overrides: List[str]) -> Dict[str, Any]:
+    """Apply command-line overrides to config."""
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(f"Invalid override format: {override}. Expected KEY=VALUE")
+
+        key_path, value = override.split("=", 1)
+        keys = key_path.split(".")
+
+        current = config
+        for key in keys[:-1]:
+            if key not in current:
+                current[key] = {}
+            current = current[key]
+
+        final_key = keys[-1]
+        try:
+            if value.lower() in ("true", "false"):
+                current[final_key] = value.lower() == "true"
+            elif "." in value:
+                current[final_key] = float(value)
+            else:
+                current[final_key] = int(value)
+        except ValueError:
+            current[final_key] = value
+
+    return config
+
+
+def parse_agent_range(range_str: str) -> range:
+    """Parse agent range string like '10-20' to range object."""
+    if isinstance(range_str, range):
+        return range_str
+    if isinstance(range_str, str):
+        start, end = map(int, range_str.split('-'))
+        return range(start, end + 1)
+    raise ValueError(f"Invalid agent range format: {range_str}")
+
+
+def parse_video_agent_selection(selection: Optional[str]) -> Optional[Set[int]]:
+    """Parse comma-separated agent counts/ranges for video rendering."""
+    if selection is None:
+        return None
+
+    selected: Set[int] = set()
+    for part in selection.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            try:
+                start_str, end_str = part.split('-', 1)
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError as exc:
+                raise ValueError(f"Invalid video agent range: '{part}'") from exc
+            if start > end:
+                raise ValueError(f"Video agent range start > end in '{part}'")
+            selected.update(range(start, end + 1))
+        else:
+            try:
+                selected.add(int(part))
+            except ValueError as exc:
+                raise ValueError(f"Invalid agent count '{part}' in --video-agents") from exc
+
+    if not selected:
+        raise ValueError("--video-agents did not include any valid agent counts")
+    return selected
+
+
+def _parse_run_start_time(run_dir: Path) -> float:
+    metadata_path = run_dir / "run_metadata.json"
+    if metadata_path.exists():
+        try:
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+            start_time = data.get("start_time")
+            if isinstance(start_time, str):
+                return time.mktime(time.strptime(start_time, "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            pass
+    try:
+        return run_dir.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+
+
+def _load_run_name_prefix(run_dir: Path) -> Optional[str]:
+    config_path = run_dir / "config" / "resolved_config.yaml"
+    if not config_path.exists():
+        return None
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        return config.get("run", {}).get("name_prefix")
+    except Exception:
+        return None
+
+
+def _discover_run_infos(roots: Iterable[Union[str, Path]]) -> List[RunInfo]:
+    run_dirs: List[Path] = []
+    for root in roots:
+        root_path = Path(root)
+        if not root_path.exists():
+            continue
+        for checkpoints_index in root_path.rglob("checkpoints.jsonl"):
+            run_dirs.append(checkpoints_index.parent)
+
+    seen = set()
+    unique_run_dirs: List[Path] = []
+    for run_dir in run_dirs:
+        resolved = run_dir.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_run_dirs.append(run_dir)
+
+    run_infos: List[RunInfo] = []
+    for run_dir in unique_run_dirs:
+        run_infos.append(
+            RunInfo(
+                path=run_dir,
+                name=run_dir.name,
+                name_prefix=_load_run_name_prefix(run_dir),
+                start_time=_parse_run_start_time(run_dir),
+            )
+        )
+    return run_infos
+
+
+def _infer_group_name(run_info: RunInfo) -> str:
+    if run_info.name_prefix:
+        return run_info.name_prefix
+    match = re.match(r"^(.+)-\d{8}-\d{6}-\d{4}$", run_info.name)
+    if match:
+        return match.group(1)
+    return run_info.name
+
+
+def _filter_run_infos(
+    run_infos: List[RunInfo],
+    group_hint: Optional[str],
+) -> List[RunInfo]:
+    if not group_hint:
+        return run_infos
+
+    group_path = Path(group_hint)
+    if group_path.exists():
+        if group_path.name == "checkpoints":
+            run_dir = group_path.parent
+        else:
+            run_dir = group_path
+        for info in run_infos:
+            if info.path.resolve() == run_dir.resolve():
+                return [info]
+        if (run_dir / "checkpoints.jsonl").exists():
+            return [
+                RunInfo(
+                    path=run_dir,
+                    name=run_dir.name,
+                    name_prefix=_load_run_name_prefix(run_dir),
+                    start_time=_parse_run_start_time(run_dir),
                 )
-            }
-        )
-        # .training(
-        #     # clip_param=0.1,
-        #     grad_clip=0.2,
-        # )
-        .resources(
-            num_gpus=NUM_GPUS,
-            # num_cpus=NUM_CPUS,
+            ]
 
-        )
-        # .rollouts(sample_timeout_s=1000)
+    filtered = [
+        info for info in run_infos
+        if info.name.startswith(group_hint) or info.name_prefix == group_hint
+    ]
+    return filtered
 
+
+def _format_checkpoint_label(record: CheckpointRecord) -> str:
+    if record.episode is not None:
+        return f"ep{record.episode}"
+    name = record.path.name.lower()
+    if "final" in name:
+        return "final"
+    return record.path.name
+
+
+def _build_checkpoint_group_listing(run_infos: List[RunInfo]) -> Dict[str, List[Dict[str, Any]]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for run_info in run_infos:
+        group_name = _infer_group_name(run_info)
+        records = _load_checkpoint_records(run_info.path)
+        metrics_entries = _load_metrics_entries(run_info.path)
+        checkpoints = []
+        for record in sorted(records, key=lambda r: (r.episode if r.episode is not None else float("inf"), r.timestamp)):
+            entry = _find_metrics_at_or_before(metrics_entries, record.episode)
+            checkpoints.append({
+                "label": _format_checkpoint_label(record),
+                "path": str(record.path),
+                "episode": record.episode,
+                "timestamp": record.timestamp,
+                "success_rate_pct": _extract_success_rate(entry or {}),
+            })
+        groups.setdefault(group_name, []).append({
+            "run_name": run_info.name,
+            "run_path": str(run_info.path),
+            "start_time": run_info.start_time,
+            "checkpoints": checkpoints,
+        })
+
+    for group_runs in groups.values():
+        group_runs.sort(key=lambda item: item.get("start_time", 0.0), reverse=True)
+    return groups
+
+
+def _load_checkpoint_records(run_dir: Path) -> List[CheckpointRecord]:
+    records: List[CheckpointRecord] = []
+    index_path = run_dir / "checkpoints.jsonl"
+    if index_path.exists():
+        with index_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                path = Path(entry.get("path", "")).expanduser()
+                if not path.is_absolute():
+                    path = (run_dir / path).resolve()
+                if not path.exists():
+                    candidate = run_dir / "checkpoints" / path.name
+                    if candidate.exists():
+                        path = candidate.resolve()
+                    else:
+                        continue
+                records.append(
+                    CheckpointRecord(
+                        path=path,
+                        episode=entry.get("episode"),
+                        timestamp=float(entry.get("timestamp", 0.0)),
+                    )
+                )
+
+    if records:
+        return records
+
+    checkpoints_dir = run_dir / "checkpoints"
+    if checkpoints_dir.exists():
+        episode_pattern = re.compile(r"_ep(\d+)")
+        for ckpt_state in checkpoints_dir.rglob("algorithm_state.pkl"):
+            episode = None
+            match = episode_pattern.search(ckpt_state.parent.name)
+            if match:
+                try:
+                    episode = int(match.group(1))
+                except ValueError:
+                    episode = None
+            records.append(
+                CheckpointRecord(
+                    path=ckpt_state.parent,
+                    episode=episode,
+                    timestamp=ckpt_state.parent.stat().st_mtime,
+                )
+            )
+    return records
+
+
+def _load_metrics_entries(run_dir: Path) -> List[Dict[str, Any]]:
+    metrics_path = run_dir / "metrics.jsonl"
+    if not metrics_path.exists():
+        return []
+    entries: List[Dict[str, Any]] = []
+    with metrics_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "episode" in entry and "metrics" in entry:
+                entries.append(entry)
+    entries.sort(key=lambda e: e.get("episode", 0))
+    return entries
+
+
+def _find_metrics_at_or_before(
+    entries: List[Dict[str, Any]],
+    episode: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    if not entries:
+        return None
+    if episode is None:
+        return entries[-1]
+    last = None
+    for entry in entries:
+        entry_episode = entry.get("episode")
+        if entry_episode is None:
+            continue
+        if entry_episode <= episode:
+            last = entry
+        else:
+            break
+    return last
+
+
+def _extract_success_rate(metrics: Dict[str, Any]) -> Optional[float]:
+    if not metrics:
+        return None
+    values = metrics.get("metrics", metrics)
+    if not isinstance(values, dict):
+        return None
+    keys = [
+        "evaluation/env_runners/custom_metrics/success_rate_pct_mean",
+        "evaluation/custom_metrics/success_rate_pct_mean",
+        "env_runners/custom_metrics/success_rate_pct_mean",
+        "custom_metrics/success_rate_pct_mean",
+    ]
+    for key in keys:
+        value = values.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _select_checkpoint_by_strategy(
+    records: List[CheckpointRecord],
+    metrics_entries: List[Dict[str, Any]],
+    strategy: str,
+    success_tolerance: float,
+) -> Path:
+    if not records:
+        raise FileNotFoundError("No checkpoints found for selected run.")
+
+    if strategy == "latest":
+        record = max(records, key=lambda r: (r.timestamp, r.episode or -1))
+        return record.path
+
+    if strategy == "oldest":
+        record = min(records, key=lambda r: (r.episode if r.episode is not None else float("inf"), r.timestamp))
+        return record.path
+
+    scored: List[Tuple[CheckpointRecord, Optional[float]]] = []
+    for record in records:
+        entry = _find_metrics_at_or_before(metrics_entries, record.episode)
+        scored.append((record, _extract_success_rate(entry or {})))
+
+    valid_scores = [score for _, score in scored if score is not None]
+    if not valid_scores:
+        record = max(records, key=lambda r: (r.timestamp, r.episode or -1))
+        logger.warning("No success metrics found; falling back to latest checkpoint %s", record.path)
+        return record.path
+
+    best_score = max(valid_scores)
+    candidates = [
+        record for record, score in scored
+        if score is not None and score >= best_score - success_tolerance
+    ]
+    if not candidates:
+        record = max(records, key=lambda r: (r.timestamp, r.episode or -1))
+        return record.path
+
+    record = min(candidates, key=lambda r: (r.episode if r.episode is not None else float("inf"), r.timestamp))
+    return record.path
+
+
+def resolve_checkpoint_path(
+    checkpoint_arg: str,
+    experiments_roots: Union[str, Path, Iterable[Union[str, Path]]] = ("experiments/train", "experiments"),
+    group_hint: Optional[str] = None,
+    strategy: str = "best",
+    success_tolerance: float = 1.0,
+) -> str:
+    """
+    Resolve checkpoint argument to full path.
+
+    If checkpoint_arg is a digit (1, 2, 3...), selects the Nth most recent run
+    (after applying group filtering) and then chooses a checkpoint within that run
+    based on the provided strategy.
+    Otherwise, returns the checkpoint path as-is.
+    """
+    arg_str = str(checkpoint_arg).strip()
+
+    if isinstance(experiments_roots, (str, Path)):
+        roots: List[Union[str, Path]] = [experiments_roots]
+    else:
+        roots = list(experiments_roots)
+    if not roots:
+        roots = ["experiments/train", "experiments"]
+
+    if arg_str.isdigit():
+        n = int(arg_str)
+        run_infos = _discover_run_infos(roots)
+        filtered_runs = _filter_run_infos(run_infos, group_hint)
+        if not filtered_runs:
+            filtered_runs = run_infos
+
+        if not filtered_runs:
+            raise FileNotFoundError(
+                "No run directories found in any search roots: " + ", ".join(str(r) for r in roots)
+            )
+
+        filtered_runs.sort(key=lambda info: info.start_time, reverse=True)
+
+        if n > len(filtered_runs):
+            raise ValueError(f"Requested run #{n} but only {len(filtered_runs)} runs found")
+
+        selected_run = filtered_runs[n - 1]
+        logger.info("Selected run: %s", selected_run.path)
+
+        records = _load_checkpoint_records(selected_run.path)
+        metrics_entries = _load_metrics_entries(selected_run.path)
+        selected_checkpoint = _select_checkpoint_by_strategy(
+            records,
+            metrics_entries,
+            strategy=strategy,
+            success_tolerance=success_tolerance,
+        )
+        logger.info("Checkpoint strategy '%s' resolved to: %s", strategy, selected_checkpoint)
+        return str(selected_checkpoint)
+
+    path = Path(arg_str).expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint path not found: {path}")
+    return str(path)
+
+
+def collect_git_info(repo_root: Path) -> Dict[str, Any]:
+    """Collect git repository information."""
+    git_dir = repo_root / ".git"
+    if not git_dir.exists():
+        return {}
+    try:
+        commit = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root)
+            .decode()
+            .strip()
+        )
+        status = (
+            subprocess.check_output(["git", "status", "--short"], cwd=repo_root)
+            .decode()
+            .strip()
+        )
+        branch = (
+            subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_root)
+            .decode()
+            .strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    return {"commit": commit, "branch": branch, "status": status}
+
+
+def build_run_name(config: Dict[str, Any], explicit_name: Optional[str]) -> str:
+    """Build run name for the evaluation."""
+    if explicit_name:
+        return explicit_name
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    name_prefix = config.get("run", {}).get("name_prefix", "eval")
+    return f"{name_prefix}-{timestamp}"
+
+
+def save_metadata(
+    experiment_dir: Path,
+    config: Dict[str, Any],
+    config_path: Path,
+    checkpoint_path: str,
+    run_name: str,
+    git_info: Dict[str, Any],
+) -> None:
+    """Save evaluation metadata."""
+    metadata = {
+        "run_name": run_name,
+        "config_path": str(config_path),
+        "checkpoint_path": checkpoint_path,
+        "start_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "git": git_info,
+    }
+
+    metadata_file = experiment_dir / "eval_metadata.json"
+    metadata_file.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
 
-    new_algorithm = new_algorithm_config.build()
-
-    # Load weights from the checkpoint
-    # new_algorithm.set_weights(algorithm.get_weights())
-    new_algorithm.restore(CHECKPOINT_PATH)
-
-    rewards = {}
-    lengths = {}
-    # env = algorithm.env_creator(algorithm.config['env_config'])
-    # env = new_algorithm.env_creator(n.config['evaluation_config']['env_config'])
-    # env._seed = 42
-    # obs, _ = env.reset(seed=42)
+    config_file = experiment_dir / "resolved_config.yaml"
+    with open(config_file, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
-    # for repeat in range(REPEATS):
-    #     print("Repeat {0} out of {1}".format(repeat+1, REPEATS))
-    #     rewards[repeat] = {}
-    #     lengths[repeat] = {}
-    #     print('='*30)
-    #     print("Repeat {0} out of {1}".format(repeat+1, REPEATS))
-    #     print('='*30)
-    #     for i, seed in enumerate(EVAL_SEEDS):
-    #         rewards[repeat][seed] = []
-    #         lengths[repeat][seed] = []
-    #         print('-' * 30)
-    #         print("Running evaluation {0} out of {1} with seed: {2}".format(i+1, len(EVAL_SEEDS), seed))
-    #         # algorithm = Algorithm.from_checkpoint(CHECKPOINT_PATH)
-    #         # # Change evaluation to render mode
-    #         # # print(algorithm.config['render_env'])
-    #         # algorithm.config['evaluation_config']["env_config"]['agents_num'] = AGENTS_NUM
-    #         # algorithm.config['evaluation_config']["env_config"]["render_mode"] = "human"
-    #         # algorithm.config['evaluation_config']['render_env'] = True
-    #         # algorithm.config['evaluation_config']["env_config"]["seed"] = 42
-    #         # print(algorithm.config['evaluation_config'])
-
-    #         for episode in range(EVAL_EPISODES):
-    #             print("Episode {0} out of {1}".format(episode+1, EVAL_EPISODES))
-    #             results = new_algorithm.evaluate()
-    #             rewards[repeat][seed].append(results["env_runners"]["episode_reward_mean"])
-    #             lengths[repeat][seed].append(results["env_runners"]["episode_len_mean"])
-
-    #         # Print mid evaluation results
-    #         print("Mean reward per agent: {0}".format(np.mean(rewards[repeat][seed])/AGENTS_NUM))
-    #         print("Mean episode length: {0}".format(np.mean(lengths[repeat][seed])))
-    #         # print("Time elapsed: {0}".format(time.time() - start_time))
-    #         # print("Expected time remaining: {0}".format((time.time() - start_time) * (len(EVAL_SEEDS) - i - 1) / (i + 1)))
-
-    # print('='*30)
-    # print("Evaluation results:")
-
-    # print("Mean reward per agent: {0}".format(np.mean([np.mean(rewards[repeat][seed]) for seed in EVAL_SEEDS for repeat in range(REPEATS)])/AGENTS_NUM))
-    # print("Min reward per agent: {0}".format(np.min([np.min(rewards[repeat][seed]) for seed in EVAL_SEEDS for repeat in range(REPEATS)])/AGENTS_NUM))
-    # print("Max reward per agent: {0}".format(np.max([np.max(rewards[repeat][seed]) for seed in EVAL_SEEDS for repeat in range(REPEATS)])/AGENTS_NUM))
-    # print("Reward std per agent: {0}".format(np.std([np.std(rewards[repeat][seed]) for seed in EVAL_SEEDS for repeat in range(REPEATS)])/AGENTS_NUM))
-    # print("Mean episode length: {0}".format(np.mean([np.mean(lengths[repeat][seed]) for seed in EVAL_SEEDS for repeat in range(REPEATS)])))
-    # print("Episode length std: {0}".format(np.std([np.std(lengths[repeat][seed]) for seed in EVAL_SEEDS for repeat in range(REPEATS)])))
+def _get_by_path(config: Dict[str, Any], path: Iterable[str]) -> Any:
+    current: Any = config
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
 
 
+def _load_training_config_from_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+    run_dir = checkpoint_path.parent.parent
+    resolved_config_path = run_dir / "config" / "resolved_config.yaml"
+    if not resolved_config_path.exists():
+        return None
+    try:
+        with resolved_config_path.open("r", encoding="utf-8") as handle:
+            return yaml.safe_load(handle) or {}
+    except Exception:
+        logger.debug("Failed to read training config from %s", resolved_config_path, exc_info=True)
+        return None
 
-    NUM_THREADS = 1
-    AGENTS_RANGE = range(4, 21)  # Range of agents_num
-    REPEATS = 10  # Number of repeats for each agents_num
 
-    time_results = {}
-    lengths_results = {}
-    deadlocks = {}
+def _warn_config_mismatches(eval_config: Dict[str, Any], train_config: Dict[str, Any]) -> None:
+    checks = [
+        ("environment.use_cnn_observation", ["environment", "use_cnn_observation"]),
+        ("environment.use_d_star_lite", ["environment", "use_d_star_lite"]),
+        ("environment.observation_size", ["environment", "observation_size"]),
+        ("environment.observation_type", ["environment", "observation_type"]),
+        ("environment.start_goal_on_periphery", ["environment", "start_goal_on_periphery"]),
+        ("environment.d_star_iterations", ["environment", "d_star_iterations"]),
+        ("environment.d_star_congestion_weight", ["environment", "d_star_congestion_weight"]),
+        ("environment.d_star_path_progress_weight", ["environment", "d_star_path_progress_weight"]),
+        ("model.model.conv_filters", ["model", "model", "conv_filters"]),
+        ("model.model.fcnet_hiddens", ["model", "model", "fcnet_hiddens"]),
+        ("model.model.use_lstm", ["model", "model", "use_lstm"]),
+    ]
+    mismatches = []
+    for label, path in checks:
+        eval_value = _get_by_path(eval_config, path)
+        train_value = _get_by_path(train_config, path)
+        if train_value is None:
+            continue
+        if eval_value != train_value:
+            mismatches.append((label, train_value, eval_value))
 
-    def run_repeat(agents_num, repeat):
-        print(f"Running evaluation with {agents_num} agents, repeat {repeat + 1}...")
-        new_algorithm_config.environment(RLMAPF, env_config=configure_env(
+    eval_maps = _get_by_path(eval_config, ["environment", "maps_names_with_variants"])
+    train_maps = _get_by_path(train_config, ["environment", "maps_names_with_variants"])
+    if isinstance(eval_maps, dict) and isinstance(train_maps, dict):
+        eval_keys = set(eval_maps.keys())
+        train_keys = set(train_maps.keys())
+        if eval_keys != train_keys:
+            mismatches.append(("environment.maps_names_with_variants", train_keys, eval_keys))
+
+    if mismatches:
+        logger.warning("Evaluation config does not match training config from checkpoint:")
+        for label, train_value, eval_value in mismatches:
+            logger.warning("  %s: train=%s eval=%s", label, train_value, eval_value)
+
+
+def sync_eval_config_with_train_config(
+    eval_config: Dict[str, Any],
+    train_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Override eval config with environment/model settings from training config."""
+    merged = deepcopy(eval_config)
+
+    train_env = deepcopy(train_config.get("environment") or {})
+    eval_env_overrides = train_config.get("evaluation_environment") or {}
+    if isinstance(eval_env_overrides, dict):
+        train_env.update(eval_env_overrides)
+    if train_env:
+        merged["environment"] = train_env
+
+    train_model = deepcopy(train_config.get("model") or {})
+    if train_model:
+        merged["model"] = train_model
+
+    train_paths = train_config.get("paths") or {}
+    if isinstance(train_paths, dict) and train_paths.get("map_root") is not None:
+        merged.setdefault("paths", {})
+        merged["paths"]["map_root"] = train_paths["map_root"]
+
+    return merged
+
+
+def plot_success_and_deadlocks(detailed_results_path: Path, plots_dir: Path) -> None:
+    """Line plots for success and deadlock rates vs agent count."""
+    try:
+        df = pd.read_csv(detailed_results_path)
+        if 'success' not in df.columns:
+            logger.warning("Success column not found; skipping success plot")
+            return
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
+        summary = df.groupby('agents_num').agg(
+            success_rate_percent=('success', lambda s: s.mean() * 100.0),
+            deadlock_rate_percent=('deadlock', lambda s: s.mean() * 100.0 if 'deadlock' in df.columns else np.nan),
+        ).reset_index()
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(summary['agents_num'], summary['success_rate_percent'], marker='o', label='Success rate (%)')
+        if 'deadlock_rate_percent' in summary:
+            ax.plot(summary['agents_num'], summary['deadlock_rate_percent'], marker='s', label='Deadlock rate (%)')
+        ax.set_xlabel('Number of agents')
+        ax.set_ylabel('Rate (%)')
+        title = 'Success and deadlock rates'
+        if repeats_count:
+            title += f" (repeats={repeats_count})"
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'success_deadlocks.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Success/deadlock plot saved")
+    except Exception as exc:
+        logger.warning("Could not generate success/deadlock plot: %s", exc)
+
+
+def plot_efficiency(detailed_results_path: Path, plots_dir: Path) -> None:
+    """Efficiency plots: episode length (successful), throughput, path efficiency."""
+    try:
+        df = pd.read_csv(detailed_results_path)
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
+        metrics = [
+            ('success_episode_length_steps', 'Episode length (successful only)'),
+            ('throughput_steps_per_sec', 'Throughput (steps/s)'),
+            ('path_efficiency', 'Path efficiency (actual/optimal)'),
+        ]
+        available = [(m, title) for m, title in metrics if m in df.columns and not df[m].isna().all()]
+        if not available:
+            logger.warning("No efficiency metrics available for plotting")
+            return
+        fig, axes = plt.subplots(1, len(available), figsize=(6 * len(available), 5))
+        if len(available) == 1:
+            axes = [axes]
+        for ax, (metric, title) in zip(axes, available):
+            summary = df.groupby('agents_num')[metric].agg(['mean', 'std']).reset_index()
+            ax.plot(summary['agents_num'], summary['mean'], marker='o', label='mean')
+            ax.fill_between(summary['agents_num'], summary['mean'] - summary['std'], summary['mean'] + summary['std'],
+                            alpha=0.25, label='±1 std')
+            ax.set_xlabel('Number of agents')
+            ax.set_ylabel(title)
+            plot_title = title
+            if repeats_count:
+                plot_title += f" (repeats={repeats_count})"
+            ax.set_title(plot_title)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'efficiency.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Efficiency plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate efficiency plot: %s", exc)
+
+
+def plot_collisions(detailed_results_path: Path, plots_dir: Path) -> None:
+    """Stacked bars for collisions per agent-step split by type."""
+    try:
+        df = pd.read_csv(detailed_results_path)
+        required = {'collision_agent_agent_per_agent_step', 'collision_agent_obstacle_per_agent_step'}
+        if not required.issubset(df.columns):
+            logger.warning("Collision rate columns not found; skipping collision plot")
+            return
+        repeats_count = df['repeat'].nunique() if 'repeat' in df.columns else None
+        summary = df.groupby('agents_num').agg({
+            'collision_agent_agent_per_agent_step': 'mean',
+            'collision_agent_obstacle_per_agent_step': 'mean',
+        }).reset_index()
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x = summary['agents_num']
+        ao = summary['collision_agent_obstacle_per_agent_step']
+        aa = summary['collision_agent_agent_per_agent_step']
+        ax.bar(x, ao, label='Agent–Obstacle', color='steelblue', alpha=0.85)
+        ax.bar(x, aa, bottom=ao, label='Agent–Agent', color='coral', alpha=0.85)
+        ax.set_xlabel('Number of agents')
+        ax.set_ylabel('Collisions per agent-step')
+        title = 'Safety: collisions by type'
+        if repeats_count:
+            title += f" (repeats={repeats_count})"
+        ax.set_title(title)
+        ax.grid(True, axis='y', alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'collisions.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Collision plot saved")
+    except Exception as exc:
+        logger.warning("Could not generate collision plot: %s", exc)
+
+
+def plot_tradeoffs(summary_path: Path, plots_dir: Path) -> None:
+    """Trade-off plots to judge efficiency vs safety and success."""
+    try:
+        summary = pd.read_csv(summary_path)
+        if summary.empty:
+            logger.warning("Summary CSV empty; skipping trade-off plots")
+            return
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        if {'success_rate_percent', 'avg_collision_total_per_agent_step', 'avg_throughput_steps_per_sec', 'agents_num'}.issubset(summary.columns):
+            sc = axes[0].scatter(
+                summary['avg_collision_total_per_agent_step'],
+                summary['success_rate_percent'],
+                c=summary['avg_throughput_steps_per_sec'],
+                s=60,
+                cmap='viridis',
+                edgecolors='k',
+            )
+            for _, row in summary.iterrows():
+                axes[0].annotate(int(row['agents_num']),
+                                 (row['avg_collision_total_per_agent_step'], row['success_rate_percent']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[0].set_xlabel('Collisions per agent-step')
+            axes[0].set_ylabel('Success rate (%)')
+            axes[0].set_title('Success vs Collisions\n(color: throughput)')
+            axes[0].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[0])
+            cbar.set_label('Throughput (steps/s)')
+
+        if {'avg_success_length_steps', 'success_rate_percent', 'avg_collision_total_per_agent_step', 'agents_num'}.issubset(summary.columns):
+            sc = axes[1].scatter(
+                summary['avg_success_length_steps'],
+                summary['success_rate_percent'],
+                c=summary['avg_collision_total_per_agent_step'],
+                s=60,
+                cmap='plasma',
+                edgecolors='k',
+            )
+            for _, row in summary.iterrows():
+                axes[1].annotate(int(row['agents_num']),
+                                 (row['avg_success_length_steps'], row['success_rate_percent']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[1].set_xlabel('Episode length (success only)')
+            axes[1].set_ylabel('Success rate (%)')
+            axes[1].set_title('Success vs Efficiency\n(color: collisions)')
+            axes[1].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[1])
+            cbar.set_label('Collisions per agent-step')
+
+        if {'avg_throughput_steps_per_sec', 'avg_collision_total_per_agent_step', 'success_rate_percent', 'agents_num'}.issubset(summary.columns):
+            sc = axes[2].scatter(
+                summary['avg_throughput_steps_per_sec'],
+                summary['avg_collision_total_per_agent_step'],
+                c=summary['success_rate_percent'],
+                s=60,
+                cmap='coolwarm',
+                edgecolors='k',
+            )
+            for _, row in summary.iterrows():
+                axes[2].annotate(int(row['agents_num']),
+                                 (row['avg_throughput_steps_per_sec'], row['avg_collision_total_per_agent_step']),
+                                 textcoords="offset points", xytext=(4, 4), ha='left', fontsize=8)
+            axes[2].set_xlabel('Throughput (steps/s)')
+            axes[2].set_ylabel('Collisions per agent-step')
+            axes[2].set_title('Throughput vs Collisions\n(color: success)')
+            axes[2].grid(True, alpha=0.3)
+            cbar = fig.colorbar(sc, ax=axes[2])
+            cbar.set_label('Success rate (%)')
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'tradeoffs.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Trade-off plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate trade-off plots: %s", exc)
+
+
+def plot_variability(detailed_results_path: Path, plots_dir: Path, sample_counts: Optional[List[int]] = None) -> None:
+    """Boxplots for collisions and length to show spread across repeats at selected agent counts."""
+    try:
+        df = pd.read_csv(detailed_results_path)
+        if 'agents_num' not in df.columns or 'repeat' not in df.columns:
+            logger.warning("agents_num/repeat columns not found; skipping variability plots")
+            return
+        if 'collision_total_per_agent_step' not in df.columns:
+            logger.warning("collision_total_per_agent_step not found; skipping variability plots")
+            return
+        if sample_counts is None:
+            unique_agents = sorted(df['agents_num'].unique())
+            if len(unique_agents) >= 3:
+                sample_counts = [unique_agents[0], unique_agents[len(unique_agents)//2], unique_agents[-1]]
+            else:
+                sample_counts = unique_agents
+
+        sample_counts = [c for c in sample_counts if c in df['agents_num'].unique()]
+        if not sample_counts:
+            logger.warning("No matching agent counts found for variability plots")
+            return
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        collision_data = [df[df['agents_num'] == n]['collision_total_per_agent_step'].dropna() for n in sample_counts]
+        axes[0].boxplot(collision_data, labels=sample_counts, patch_artist=True)
+        axes[0].set_xlabel('Number of agents')
+        axes[0].set_ylabel('Collisions per agent-step')
+        axes[0].set_title('Collision variability across repeats')
+        axes[0].grid(True, axis='y', alpha=0.3)
+
+        if 'success_episode_length_steps' in df.columns:
+            length_data = [df[df['agents_num'] == n]['success_episode_length_steps'].dropna() for n in sample_counts]
+            axes[1].boxplot(length_data, labels=sample_counts, patch_artist=True)
+            axes[1].set_xlabel('Number of agents')
+            axes[1].set_ylabel('Episode length (success only)')
+            axes[1].set_title('Length variability across repeats')
+            axes[1].grid(True, axis='y', alpha=0.3)
+        else:
+            axes[1].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'variability.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Variability plots saved")
+    except Exception as exc:
+        logger.warning("Could not generate variability plots: %s", exc)
+
+
+def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
+    """Generate 2×3 grid comparing metrics across maps."""
+    try:
+        dfs = {}
+        for label, summary_path in map_summaries.items():
+            if summary_path.exists():
+                dfs[label] = pd.read_csv(summary_path)
+        if len(dfs) < 2:
+            logger.warning("Need at least 2 maps for cross-map comparison")
+            return
+        metrics = [
+            ('avg_success_rate_percent', 'Success rate (%)'),
+            ('avg_deadlock_rate_percent', 'Deadlock rate (%)'),
+            ('avg_success_length_steps', 'Episode length (success)'),
+            ('avg_throughput_steps_per_sec', 'Throughput (steps/s)'),
+            ('avg_collision_agent_agent_per_agent_step', 'Agent–Agent collisions/agent-step'),
+            ('avg_collision_agent_obstacle_per_agent_step', 'Agent–Obstacle collisions/agent-step'),
+        ]
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes = axes.flatten()
+        for idx, (metric, title) in enumerate(metrics):
+            for map_label, df in dfs.items():
+                if metric in df.columns:
+                    axes[idx].plot(df['agents_num'], df[metric], marker='o', linewidth=2, label=map_label)
+            axes[idx].set_xlabel('Number of agents')
+            axes[idx].set_ylabel(title)
+            axes[idx].set_title(title)
+            axes[idx].legend()
+            axes[idx].grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'cross_map_comparison.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("Cross-map comparison plot saved")
+    except Exception as e:
+        logger.warning("Could not generate cross-map comparison plot: %s", e)
+
+
+def create_cross_map_summary(map_summaries: Dict[str, Path], output_path: Path):
+    """Aggregate all map results into single CSV."""
+    try:
+        all_data = []
+        for map_label, summary_path in map_summaries.items():
+            if summary_path.exists():
+                df = pd.read_csv(summary_path)
+                df['map'] = map_label
+                all_data.append(df)
+        if not all_data:
+            logger.warning("No map summaries found for aggregation")
+            return
+        combined_df = pd.concat(all_data, ignore_index=True)
+        cols = ['map'] + [col for col in combined_df.columns if col != 'map']
+        combined_df = combined_df[cols]
+        combined_df.to_csv(output_path, index=False)
+        logger.info("Cross-map summary saved to %s", output_path)
+    except Exception as e:
+        logger.warning("Could not create cross-map summary: %s", e)
+
+
+class Evaluator:
+    def __init__(self, args: argparse.Namespace):
+        self._args = args
+        self._repo_root = Path(__file__).resolve().parent
+        self._config_path = resolve_config_path(args.config, args.config_dir, self._repo_root)
+        self._config = load_config(self._config_path)
+        self._paths_config = self._config.get('paths', {})
+
+        checkpoint_search_roots = self._checkpoint_search_roots()
+        group_hint = args.checkpoint_group or self._config.get('eval_checkpoint_group')
+        if group_hint is None:
+            group_hint = self._config.get('run', {}).get('name_prefix')
+        checkpoint_strategy = args.checkpoint_strategy or self._config.get('eval_checkpoint_strategy', 'best')
+        success_tolerance = args.checkpoint_success_tolerance
+        if success_tolerance is None:
+            success_tolerance = float(self._config.get('eval_checkpoint_success_tolerance', 1.0))
+
+        self._checkpoint_group_hint = group_hint
+        self._checkpoint_strategy = checkpoint_strategy
+        self._checkpoint_success_tolerance = success_tolerance
+
+        resolved_checkpoint = resolve_checkpoint_path(
+            args.checkpoint,
+            checkpoint_search_roots,
+            group_hint=self._checkpoint_group_hint,
+            strategy=self._checkpoint_strategy,
+            success_tolerance=self._checkpoint_success_tolerance,
+        )
+        self._checkpoint_path = Path(resolved_checkpoint).resolve()
+
+        self._train_config: Optional[Dict[str, Any]] = None
+        if args.sync_train_config:
+            self._train_config = _load_training_config_from_checkpoint(self._checkpoint_path)
+            if self._train_config is None:
+                raise ValueError(
+                    "Unable to locate training config next to checkpoint. "
+                    "Expected config/resolved_config.yaml in the training run directory."
+                )
+            self._config = sync_eval_config_with_train_config(self._config, self._train_config)
+            train_config_path = self._checkpoint_path.parent.parent / "config" / "resolved_config.yaml"
+            logger.info("Synced eval config with training config at %s", train_config_path)
+
+        if args.overrides:
+            logger.info("Applying %d override(s)", len(args.overrides))
+            self._config = apply_overrides(self._config, args.overrides)
+
+        self._video_agent_selection = parse_video_agent_selection(args.video_agents)
+        self._run_name = build_run_name(self._config, args.run_name)
+        self._results_dir = self._resolve_results_dir(args.results_dir)
+
+        self._hardware_config = self._config.get('hardware', {})
+        self._model_config = self._config.get('model', {})
+        self._env_config = self._config.get('environment', {})
+        self._paths_config = self._config.get('paths', {})
+
+        self._num_cpus = self._hardware_config.get('num_cpus', 2)
+        self._num_gpus = self._hardware_config.get('num_gpus', 0)
+
+        self._agents_range = parse_agent_range(self._config.get('eval_agents_range', '4-20'))
+        self._num_threads = args.num_threads if args.num_threads is not None else self._config.get('eval_num_threads', 1)
+        self._repeats = args.repeats if args.repeats is not None else self._config.get('eval_repeats', 10)
+        self._render_video = args.render_video
+        if self._render_video and args.repeats is None:
+            self._repeats = 1
+            logger.info("Video rendering enabled - setting repeats to 1 (override with --repeats if needed)")
+
+        self._env_builder = EnvConfigBuilder(self._config)
+        self._algo_factory = AlgorithmFactory(self._model_config, self._num_gpus)
+        self._map_specs, self._multi_map_enabled = self._resolve_map_specs()
+
+        self._warn_if_config_mismatch()
+
+    def _resolve_results_dir(self, results_dir: Optional[str]) -> Path:
+        if results_dir:
+            return Path(results_dir).resolve()
+        results_base = Path(self._config.get('paths', {}).get('experiments_root', 'experiments'))
+        name_prefix = self._config.get('run', {}).get('name_prefix')
+        if name_prefix:
+            return (results_base / name_prefix / self._run_name).resolve()
+        return (results_base / self._run_name).resolve()
+
+    def _checkpoint_search_roots(self) -> List[Union[str, Path]]:
+        experiments_root = self._paths_config.get('experiments_root')
+        train_experiments_root = self._paths_config.get('train_experiments_root', 'experiments/train')
+        roots: List[Union[str, Path]] = []
+        if experiments_root:
+            roots.append(experiments_root)
+        if train_experiments_root and all(Path(train_experiments_root) != Path(existing) for existing in roots):
+            roots.append(train_experiments_root)
+        if all(Path('experiments') != Path(existing) for existing in roots):
+            roots.append('experiments')
+        return roots
+
+    def _resolve_map_specs(self) -> Tuple[List[MapSpec], bool]:
+        eval_maps_config = self._config.get('eval_maps', {})
+        multi_map_enabled = eval_maps_config.get('enabled', False)
+        if multi_map_enabled:
+            maps_to_evaluate = eval_maps_config.get('maps', [])
+            map_specs = []
+            for item in maps_to_evaluate:
+                map_specs.append(
+                    MapSpec(
+                        name=item['name'],
+                        variants=item.get('variants'),
+                        label=item.get('label', item['name']),
+                    )
+                )
+            return map_specs, True
+
+        current_map = list(self._env_config.get('maps_names_with_variants', {}).keys())[0]
+        map_spec = MapSpec(
+            name=current_map,
+            variants=self._env_config.get('maps_names_with_variants', {}).get(current_map),
+            label=current_map,
+        )
+        return [map_spec], False
+
+    def _warn_if_config_mismatch(self) -> None:
+        train_config = self._train_config or _load_training_config_from_checkpoint(self._checkpoint_path)
+        if train_config is None:
+            return
+        _warn_config_mismatches(self._config, train_config)
+
+    def run(self) -> int:
+        self._results_dir.mkdir(parents=True, exist_ok=True)
+
+        git_info = collect_git_info(self._repo_root) if self._config.get('logging', {}).get('log_git_info', True) else {}
+        save_metadata(self._results_dir, self._config, self._config_path, str(self._checkpoint_path), self._run_name, git_info)
+
+        self._log_checkpoint_groups()
+        self._log_header()
+
+        return_code = 0
+        map_summary_paths: Dict[str, Path] = {}
+
+        try:
+            ray_context = ray.init(
+                num_cpus=self._num_cpus,
+                num_gpus=self._num_gpus,
+            )
+            logger.info("Ray initialized (dashboard: %s)", ray_context.dashboard_url)
+
+            for map_idx, map_spec in enumerate(self._map_specs):
+                if self._multi_map_enabled:
+                    logger.info("")
+                    logger.info("=" * 80)
+                    logger.info("EVALUATING MAP %d/%d: %s", map_idx + 1, len(self._map_specs), map_spec.label)
+                    logger.info("Map: %s", map_spec.name)
+                    logger.info("=" * 80)
+
+                if self._multi_map_enabled:
+                    current_results_dir = self._results_dir / f"map_{map_spec.label.replace(' ', '_').lower()}"
+                    current_results_dir.mkdir(parents=True, exist_ok=True)
+                    logger.info("Map results directory: %s", current_results_dir)
+                else:
+                    current_results_dir = self._results_dir
+
+                summary_path = self._evaluate_map(map_spec, current_results_dir)
+                if self._multi_map_enabled and summary_path is not None:
+                    map_summary_paths[map_spec.label] = summary_path
+
+            if self._multi_map_enabled and len(map_summary_paths) > 1:
+                self._run_cross_map_comparison(map_summary_paths)
+
+        except KeyboardInterrupt:
+            logger.warning("Interrupted by user.")
+            return_code = 130
+        except Exception as exc:
+            logger.exception("Evaluation failed due to an unexpected error: %s", exc)
+            return_code = 1
+        finally:
+            ray.shutdown()
+
+        return return_code
+
+    def _log_checkpoint_groups(self) -> None:
+        checkpoint_search_roots = self._checkpoint_search_roots()
+        run_infos = _discover_run_infos(checkpoint_search_roots)
+        if not run_infos:
+            logger.warning("No checkpoint runs discovered in %s", checkpoint_search_roots)
+            return
+
+        groups = _build_checkpoint_group_listing(run_infos)
+        groups_path = self._results_dir / "checkpoint_groups.json"
+        try:
+            groups_path.write_text(json.dumps(groups, indent=2, sort_keys=True), encoding="utf-8")
+            logger.info("Checkpoint groups saved to %s", groups_path)
+        except Exception:
+            logger.debug("Failed to write checkpoint group listing to %s", groups_path, exc_info=True)
+
+        logger.info("Available checkpoint groups:")
+        for group_name, runs in sorted(groups.items()):
+            logger.info("  Group: %s (%d run(s))", group_name, len(runs))
+            for run in runs:
+                checkpoints = run.get("checkpoints", [])
+                if not checkpoints:
+                    logger.info("    %s -> no checkpoints", run.get("run_name"))
+                    continue
+                labels = []
+                for checkpoint in checkpoints:
+                    label = checkpoint.get("label", "?")
+                    success = checkpoint.get("success_rate_pct")
+                    if success is not None:
+                        label = f"{label}:{success:.2f}%"
+                    labels.append(label)
+                logger.info("    %s -> %s", run.get("run_name"), ", ".join(labels))
+
+    def _log_header(self) -> None:
+        logger.info("=" * 80)
+        logger.info("Evaluation Configuration")
+        logger.info("=" * 80)
+        logger.info("Run name: %s", self._run_name)
+        logger.info("Results directory: %s", self._results_dir)
+        logger.info("Checkpoint: %s", self._checkpoint_path)
+        if self._args.checkpoint.isdigit():
+            logger.info(
+                "Checkpoint selection: group=%s strategy=%s tolerance=%.3f",
+                self._checkpoint_group_hint or "auto",
+                self._checkpoint_strategy,
+                self._checkpoint_success_tolerance,
+            )
+        logger.info("Agent range: %s", list(self._agents_range))
+        logger.info("Threads: %d, Repeats: %d", self._num_threads, self._repeats)
+        logger.info("CPUs: %d, GPUs: %d", self._num_cpus, self._num_gpus)
+        if self._render_video:
+            if self._video_agent_selection:
+                selection_str = ", ".join(str(num) for num in sorted(self._video_agent_selection))
+                logger.info("Video rendering: ENABLED (only for agents: %s)", selection_str)
+            else:
+                logger.info("Video rendering: ENABLED (for all agent counts)")
+        else:
+            logger.info("Video rendering: DISABLED")
+        logger.info("=" * 80)
+
+    def _evaluate_map(self, map_spec: MapSpec, results_dir: Path) -> Optional[Path]:
+        results_tracker = ResultsTracker()
+
+        for agents_num in self._agents_range:
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info("Evaluating with %d agents", agents_num)
+            logger.info("=" * 80)
+
+            repeat_results = self._run_repeats_for_agent_count(map_spec, agents_num, results_dir)
+            for result in repeat_results:
+                results_tracker.add(result)
+
+            self._write_intermediate_results(results_tracker, agents_num, results_dir)
+
+        summary_df = results_tracker.summary_dataframe()
+        if summary_df.empty:
+            logger.warning("No results collected for map %s", map_spec.label)
+            return None
+
+        self._write_final_results(results_tracker, summary_df, results_dir)
+        self._generate_plots(results_dir)
+
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("Evaluation completed successfully!")
+        logger.info("Results saved to: %s", results_dir)
+        if self._render_video:
+            logger.info("Videos saved to: %s/*.mp4", results_dir)
+        logger.info("=" * 80)
+
+        return results_dir / 'summary.csv'
+
+    def _run_repeats_for_agent_count(self, map_spec: MapSpec, agents_num: int, results_dir: Path) -> List[EpisodeResult]:
+        results: List[EpisodeResult] = []
+        with ThreadPoolExecutor(max_workers=self._num_threads) as executor:
+            futures = [
+                executor.submit(self._run_repeat, map_spec, agents_num, repeat, results_dir)
+                for repeat in range(self._repeats)
+            ]
+            for future in as_completed(futures):
+                results.append(future.result())
+        return results
+
+    def _run_repeat(self, map_spec: MapSpec, agents_num: int, repeat: int, results_dir: Path) -> EpisodeResult:
+        logger.info("Evaluating with %d agents, repeat %d/%d", agents_num, repeat + 1, self._repeats)
+
+        should_render = self._render_video and (
+            self._video_agent_selection is None or agents_num in self._video_agent_selection
+        )
+
+        video_path = None
+        if should_render:
+            video_filename = f"evaluation_{agents_num}agents_repeat{repeat}.mp4"
+            video_path = str(results_dir / video_filename)
+            logger.info("Rendering video to: %s", video_path)
+
+        env_config = self._env_builder.build(
             agents_num=agents_num,
-            maps_names_with_variants={
-                "pprai_1-20a-42x39": None,
-            },
-            max_steps=200,
-            reward_closer_to_goal_final=True,
-            reward_final_d_star=False,
-            use_d_star_lite=USE_D_STAR_LITE,
+            seed=42 + repeat,
+            render_video=False,
+            video_path=None,
             render_mode="none",
-            seed=42 + repeat  # Use a different seed for each repeat
-        ))
-        new_algorithm = new_algorithm_config.build()
-        new_algorithm.restore(CHECKPOINT_PATH)
+            map_spec=map_spec,
+        )
+
+        algorithm = self._algo_factory.build(env_config)
+        algorithm.restore(str(self._checkpoint_path))
+        policy = algorithm.get_policy()
+
+        try:
+            if should_render and video_path is not None:
+                self._render_video_episode(policy, map_spec, agents_num, repeat, video_path)
+
+            result = self._rollout_episode(policy, map_spec, agents_num, repeat)
+        finally:
+            algorithm.stop()
+
+        return result
+
+    def _render_video_episode(
+        self,
+        policy: Any,
+        map_spec: MapSpec,
+        agents_num: int,
+        repeat: int,
+        video_path: str,
+    ) -> None:
+        env_config = self._env_builder.build(
+            agents_num=agents_num,
+            seed=42 + repeat,
+            render_video=True,
+            video_path=video_path,
+            render_mode=None,
+            map_spec=map_spec,
+        )
+
+        env = RLMAPF(env_config)
+        controller = PolicyController(policy, explore=False)
+
+        try:
+            obs, _ = env.reset()
+            step_count = 0
+            max_steps = env_config.get('max_steps', env.max_steps)
+            while step_count < max_steps:
+                actions = {agent_id: controller.act(agent_id, agent_obs) for agent_id, agent_obs in obs.items()}
+                obs, rewards, dones, truncated, _ = env.step(actions)
+                if isinstance(rewards, dict):
+                    for agent_id, reward in rewards.items():
+                        controller.update_reward(agent_id, reward if reward is not None else 0.0)
+                step_count += 1
+                if dones.get('__all__', False) or truncated.get('__all__', False):
+                    break
+            env.finalize_video()
+            logger.info("Video saved to: %s", video_path)
+        except Exception as exc:
+            logger.warning("Video rendering failed: %s", exc)
+        finally:
+            env.close()
+
+    def _rollout_episode(
+        self,
+        policy: Any,
+        map_spec: MapSpec,
+        agents_num: int,
+        repeat: int,
+    ) -> EpisodeResult:
+        env_config = self._env_builder.build(
+            agents_num=agents_num,
+            seed=42 + repeat,
+            render_video=False,
+            video_path=None,
+            render_mode="none",
+            map_spec=map_spec,
+        )
+
+        env = RLMAPF(env_config)
+        controller = PolicyController(policy, explore=False)
 
         start_time = time.time()
-        try:
-            results = new_algorithm.evaluate()
-            elapsed_time = time.time() - start_time
-            episode_len = results['env_runners']['episode_len_mean']
-            print(f"Evaluation completed in {elapsed_time:.5f} seconds.")
-            print(f"Steps taken: {episode_len}")
-            deadlock = 0 if episode_len < 200 else 1  # Assuming deadlock if episode_len >= 200
-            return (agents_num, repeat, elapsed_time, episode_len, deadlock)
-        except Exception as e:
-            print(f"Error during evaluation: {e}")
-            return (agents_num, repeat, None, None, 1)  # deadlock
+        obs, info = env.reset()
+        step_count = 0
+        max_steps = env_config.get('max_steps', env.max_steps)
+        done = False
 
-    # Create a folder to save results with readable timestamp
-    results_folder_name = 'eval_test_results_' + time.strftime("%Y%m%d_%H%M%S")
-    if not os.path.exists(results_folder_name):
-        os.makedirs(results_folder_name)
-    print(f"Results will be saved in folder: {results_folder_name}")
+        agents_reached_goal: Set[str] = set()
+        agent_completion_steps: Dict[str, int] = {}
+        total_reward = 0.0
+        wait_actions = 0
 
-    for agents_num in AGENTS_RANGE:
-        deadlocks[agents_num] = 0
-        with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-            futures = [executor.submit(run_repeat, agents_num, repeat) for repeat in range(REPEATS)]
-            for future in as_completed(futures):
-                agents_num_r, repeat_r, elapsed_time, episode_len, deadlock = future.result()
-                if elapsed_time is not None and deadlock == 0:
-                    time_results[(agents_num_r, repeat_r)] = elapsed_time
-                if episode_len is not None and deadlock == 0:
-                    lengths_results[(agents_num_r, repeat_r)] = episode_len
-                deadlocks[agents_num_r] += deadlock
+        agent_agent_collision_total = 0
+        agent_obstacle_collision_total = 0
 
-        # Print and save intermediate results
-        avg_time = {key[0]: 0 for key in time_results.keys() if key[0] == agents_num}
-        for key, total_time in time_results.items():
-            if key[0] == agents_num:
-                avg_time[key[0]] += total_time / len([k for k in time_results if k[0] == key[0]])
-        avg_length = {key[0]: 0 for key in lengths_results.keys() if key[0] == agents_num}
-        for key, total_length in lengths_results.items():
-            if key[0] == agents_num:
-                avg_length[key[0]] += total_length / len([k for k in lengths_results if k[0] == key[0]])
-        print(f"Intermediate results for {agents_num} agents:")
-        print(f"Average time: {avg_time[agents_num]:.5f} seconds, Length: {avg_length[agents_num]:.2f}, Deadlocks: {deadlocks[agents_num]}")
+        total_agents = env_config.get('agents_num', agents_num)
+        agent_ids_for_counters = [
+            agent_id for agent_id in getattr(env, "agent_positions", {}).keys()
+            if agent_id != "__all__" and agent_id != "__common__"
+        ]
+        collision_counters = {
+            agent_id: info.get(agent_id, {}).get("number_of_collisions", 0)
+            for agent_id in agent_ids_for_counters
+        }
 
-        # Save intermediate results to file
-        intermediate_name = results_folder_name + f'/intermediate_results_{agents_num}_agents'
-        with open(intermediate_name + '.txt', 'w') as f:
-            f.write(f"Intermediate results for {agents_num} agents:\n")
-            f.write(f"Average time: {avg_time[agents_num]:.5f} seconds, Length: {avg_length[agents_num]:.2f}, Deadlocks: {deadlocks[agents_num]}\n")
-            f.write("\nDetailed time results:\n")
-            for (agents_num_r, repeat), elapsed_time in time_results.items():
-                if agents_num_r == agents_num:
-                    f.write(f"Agents: {agents_num_r}, Repeat: {repeat}, Time: {elapsed_time:.5f} seconds\n")
+        prev_positions: Dict[str, Tuple[int, int]] = {}
 
-        # Save intermediate results to CSV
-        df = pd.DataFrame.from_dict(
-            {
-            key: {
-                'elapsed_time': elapsed_time,
-                'episode_length': lengths_results[key]
-            } for key, elapsed_time in time_results.items() if key[0] == agents_num
-            },
-            orient='index'
+        while not done and step_count < max_steps:
+            if hasattr(env, 'agent_positions'):
+                prev_positions = {
+                    agent_id: tuple(env.agent_positions[agent_id])
+                    for agent_id in obs.keys()
+                    if agent_id in env.agent_positions
+                }
+
+            actions = {}
+            intended_positions = {}
+            for agent_id, agent_obs in obs.items():
+                action = controller.act(agent_id, agent_obs)
+                actions[agent_id] = action
+                delta = ACTION_DELTAS.get(action, (0, 0))
+                prev = prev_positions.get(agent_id, (0, 0))
+                intended_positions[agent_id] = (prev[0] + delta[0], prev[1] + delta[1])
+
+            wait_actions += sum(1 for action in actions.values() if action == 4)
+
+            obs, rewards, dones, truncated, info = env.step(actions)
+            total_reward += sum(rewards.values())
+            for agent_id, reward in rewards.items():
+                controller.update_reward(agent_id, reward if reward is not None else 0.0)
+
+            for agent_id, is_done in dones.items():
+                if agent_id == "__all__":
+                    continue
+                if is_done and agent_id not in agents_reached_goal:
+                    agents_reached_goal.add(agent_id)
+                    agent_completion_steps[agent_id] = step_count
+
+            collision_deltas = {}
+            for agent_id in collision_counters.keys():
+                new_count = info.get(agent_id, {}).get("number_of_collisions", collision_counters[agent_id])
+                delta = new_count - collision_counters[agent_id]
+                if delta > 0:
+                    collision_deltas[agent_id] = delta
+                collision_counters[agent_id] = new_count
+
+            if collision_deltas:
+                for agent_id, delta in collision_deltas.items():
+                    is_agent_collision = False
+                    for other_id in collision_deltas.keys():
+                        if other_id == agent_id:
+                            continue
+                        if intended_positions.get(agent_id) == intended_positions.get(other_id):
+                            is_agent_collision = True
+                            break
+                        if (
+                            intended_positions.get(agent_id) == prev_positions.get(other_id)
+                            and intended_positions.get(other_id) == prev_positions.get(agent_id)
+                        ):
+                            is_agent_collision = True
+                            break
+                        if (
+                            intended_positions.get(agent_id) == prev_positions.get(other_id)
+                            and actions.get(other_id, 4) == 4
+                        ):
+                            is_agent_collision = True
+                            break
+                    if is_agent_collision:
+                        agent_agent_collision_total += delta
+                    else:
+                        agent_obstacle_collision_total += delta
+
+            step_count += 1
+            done = dones.get("__all__", False) or truncated.get("__all__", False)
+
+        env.close()
+        elapsed_time = time.time() - start_time
+
+        episode_len = step_count
+        goal_completion_rate = (len(agents_reached_goal) / total_agents * 100.0) if total_agents > 0 else 0.0
+        success = (
+            episode_len < max_steps
+            and total_agents > 0
+            and goal_completion_rate >= 99.9
         )
-        df.index.names = ['agents_num', 'repeat']
-        df.reset_index(inplace=True)
-        df.to_csv(intermediate_name + '.csv', index=False)
+        avg_steps_to_goal = (
+            sum(agent_completion_steps.values()) / len(agent_completion_steps)
+            if agent_completion_steps
+            else np.nan
+        )
+        if agent_completion_steps:
+            mean_completion = float(np.mean(list(agent_completion_steps.values())))
+            completion_deviation = float(np.mean([abs(v - mean_completion) for v in agent_completion_steps.values()]))
+        else:
+            completion_deviation = np.nan
 
-    avg_time = {key[0]: 0 for key in time_results.keys()}
-    avg_length = {key[0]: 0 for key in lengths_results.keys()}
-    print('==' * 30)
-    for key, total_time in time_results.items():
-        avg_time[key[0]] += total_time / len([k for k in time_results if k[0] == key[0]])
-    for key, total_length in lengths_results.items():
-        avg_length[key[0]] += total_length / len([k for k in lengths_results if k[0] == key[0]])
-    print("Average time results:")
-    for agents_num, total_time in avg_time.items():
-        print(f"Agents: {agents_num}, Average time: {total_time:.5f} seconds, Length: {avg_length[agents_num]:.2f}, Deadlocks: {deadlocks[agents_num]}")
+        total_collisions = agent_agent_collision_total + agent_obstacle_collision_total
+        throughput = episode_len / elapsed_time if elapsed_time > 0 else 0.0
 
-    # Save final results to file
-    final_name = results_folder_name + '/final_results'
-    with open(final_name + '.txt', 'w') as f:
-        f.write("Average time results:\n")
-        for agents_num, total_time in avg_time.items():
-            f.write(f"Agents: {agents_num}, Average time: {total_time:.5f} seconds, Deadlocks: {deadlocks[agents_num]}\n")
-        f.write("\nDetailed time results:\n")
-        for (agents_num, repeat), elapsed_time in time_results.items():
-            f.write(f"Agents: {agents_num}, Repeat: {repeat}, Time: {elapsed_time:.5f} seconds\n")
+        denom = max(episode_len * total_agents, 1)
+        collision_agent_agent_rate = agent_agent_collision_total / denom
+        collision_agent_obstacle_rate = agent_obstacle_collision_total / denom
+        collision_total_rate = total_collisions / denom
 
-    # Save final results to CSV
-    df = pd.DataFrame.from_dict(
-        {
-            key: {
-                'elapsed_time': elapsed_time,
-                'episode_length': lengths_results[key]
-            } for key, elapsed_time in time_results.items()
-        },
-        orient='index'
+        path_efficiency = np.nan
+        if getattr(env, "start_d_star_paths", None) and agent_completion_steps:
+            efficiencies = []
+            for agent_id, steps_to_goal in agent_completion_steps.items():
+                start_path = env.start_d_star_paths.get(agent_id)
+                if start_path:
+                    optimal_len = max(len(start_path), 1)
+                    efficiencies.append(steps_to_goal / optimal_len)
+            if efficiencies:
+                path_efficiency = float(np.mean(efficiencies))
+
+        success_episode_length = episode_len if success else np.nan
+        deadlock = 0 if episode_len < max_steps else 1
+
+        logger.info(
+            "Completed in %.4f s | steps=%d | reward=%.2f | collisions=%d "
+            "(agent-agent=%d, agent-obstacle=%d) | wait actions=%d | "
+            "goal_rate=%.1f%% | throughput=%.2f steps/s | success=%s",
+            elapsed_time,
+            episode_len,
+            total_reward,
+            total_collisions,
+            agent_agent_collision_total,
+            agent_obstacle_collision_total,
+            wait_actions,
+            goal_completion_rate,
+            throughput,
+            success,
+        )
+
+        return EpisodeResult(
+            agents_num=agents_num,
+            repeat=repeat,
+            episode_runtime_seconds=elapsed_time,
+            episode_length_steps=episode_len,
+            total_reward=total_reward,
+            total_collisions=total_collisions,
+            collision_agent_agent=agent_agent_collision_total,
+            collision_agent_obstacle=agent_obstacle_collision_total,
+            throughput_steps_per_sec=throughput,
+            wait_actions=wait_actions,
+            goal_completion_rate_percent=goal_completion_rate,
+            average_steps_to_goal=avg_steps_to_goal,
+            completion_step_deviation=completion_deviation,
+            success=success,
+            path_efficiency=path_efficiency,
+            collision_agent_agent_per_agent_step=collision_agent_agent_rate,
+            collision_agent_obstacle_per_agent_step=collision_agent_obstacle_rate,
+            collision_total_per_agent_step=collision_total_rate,
+            success_episode_length_steps=success_episode_length,
+            deadlock=deadlock,
+        )
+
+    def _write_intermediate_results(self, tracker: ResultsTracker, agents_num: int, results_dir: Path) -> None:
+        agent_df = tracker.agent_dataframe(agents_num)
+        if agent_df.empty:
+            return
+
+        avg_time = agent_df['episode_runtime_seconds'].mean()
+        avg_length = agent_df['episode_length_steps'].mean()
+        avg_success_length = agent_df['success_episode_length_steps'].mean()
+        success_rate = agent_df['success'].mean() * 100.0
+        deadlocks = agent_df['deadlock'].sum()
+
+        logger.info("")
+        logger.info("Results for %d agents:", agents_num)
+        logger.info("  Average episode time: %.5f s", avg_time)
+        logger.info("  Average episode length: %.2f steps", avg_length)
+        logger.info("  Success rate: %.1f%%", success_rate)
+        logger.info("  Deadlocks: %d/%d", deadlocks, len(agent_df))
+
+        intermediate_name = results_dir / f'intermediate_results_{agents_num}_agents'
+
+        with open(str(intermediate_name) + '.txt', 'w') as f:
+            f.write(f"Results for {agents_num} agents:\n")
+            f.write(f"Average episode time: {avg_time:.5f} seconds\n")
+            f.write(f"Average episode length: {avg_length:.2f} steps\n")
+            f.write(f"Average success episode length: {avg_success_length:.2f} steps\n")
+            f.write(f"Success rate: {success_rate:.1f}%\n")
+            f.write(f"Deadlocks: {deadlocks}/{len(agent_df)}\n")
+            f.write("\nDetailed results:\n")
+            for _, row in agent_df.sort_values(['repeat']).iterrows():
+                f.write(
+                    f"Repeat {int(row['repeat'])}: Time={row['episode_runtime_seconds']:.5f}s, "
+                    f"Length={row['episode_length_steps']:.2f} steps, "
+                    f"Success_len={row['success_episode_length_steps']}\n"
+                )
+
+        agent_df.to_csv(str(intermediate_name) + '.csv', index=False)
+
+    def _write_final_results(self, tracker: ResultsTracker, summary_df: pd.DataFrame, results_dir: Path) -> None:
+        final_name = results_dir / 'final_results'
+        df = tracker.dataframe()
+        df.to_csv(str(final_name) + '.csv', index=False)
+
+        summary_df.to_csv(str(results_dir / 'summary.csv'), index=False)
+
+        headline_cols = [
+            'agents_num',
+            'success_rate_percent',
+            'deadlock_rate_percent',
+            'avg_success_length_steps',
+            'avg_throughput_steps_per_sec',
+            'avg_collision_agent_agent_per_agent_step',
+            'avg_collision_agent_obstacle_per_agent_step',
+            'avg_collision_total_per_agent_step',
+            'avg_path_efficiency',
+        ]
+        existing_cols = [c for c in headline_cols if c in summary_df.columns]
+        if existing_cols:
+            summary_df[existing_cols].to_csv(str(results_dir / 'at_a_glance.csv'), index=False)
+
+        with open(str(final_name) + '.txt', 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("Final Evaluation Results\n")
+            f.write("=" * 80 + "\n\n")
+            for _, item in summary_df.iterrows():
+                f.write(f"Agents: {int(item['agents_num']):2d} | ")
+                f.write(f"Time: {item['avg_time_seconds']:7.5f}s | ")
+                f.write(f"Length: {item['avg_length_steps']:6.2f} steps | ")
+                f.write(f"Success: {item['success_rate_percent']:.1f}% | ")
+                f.write(f"Deadlocks: {int(item['deadlocks'])}/{int(item['total_runs'])}")
+                f.write(f" ({item['deadlock_rate_percent']:.1f}% deadlock)\n")
+
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("Detailed Results\n")
+            f.write("=" * 80 + "\n\n")
+            for _, row in df.sort_values(['agents_num', 'repeat']).iterrows():
+                f.write(
+                    f"Agents: {int(row['agents_num'])}, Repeat: {int(row['repeat'])}, "
+                    f"Time: {row['episode_runtime_seconds']:.5f}s, "
+                    f"Length: {row['episode_length_steps']:.2f} steps\n"
+                )
+
+    def _generate_plots(self, results_dir: Path) -> None:
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("GENERATING PLOTS")
+        logger.info("=" * 80)
+
+        plots_dir = results_dir / "plots"
+        plots_dir.mkdir(exist_ok=True)
+
+        detailed_results_csv = results_dir / 'final_results.csv'
+        summary_csv = results_dir / 'summary.csv'
+        if detailed_results_csv.exists():
+            plot_success_and_deadlocks(detailed_results_csv, plots_dir)
+            plot_efficiency(detailed_results_csv, plots_dir)
+            plot_collisions(detailed_results_csv, plots_dir)
+            plot_tradeoffs(summary_csv, plots_dir)
+            plot_variability(detailed_results_csv, plots_dir)
+            logger.info("Plots generated in: %s", plots_dir)
+        else:
+            logger.warning("Detailed results CSV not found, skipping plotting")
+
+    def _run_cross_map_comparison(self, map_summary_paths: Dict[str, Path]) -> None:
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("CROSS-MAP COMPARISON")
+        logger.info("=" * 80)
+
+        cross_map_dir = self._results_dir / "cross_map_comparison"
+        cross_map_dir.mkdir(exist_ok=True)
+
+        eval_maps_config = self._config.get('eval_maps', {})
+        if eval_maps_config.get('generate_comparison_plots', True):
+            plot_cross_map_comparison(map_summary_paths, cross_map_dir)
+
+        if eval_maps_config.get('aggregate_results', True):
+            create_cross_map_summary(map_summary_paths, cross_map_dir / 'all_maps_summary.csv')
+
+        logger.info("Cross-map comparison saved to: %s", cross_map_dir)
+        logger.info("=" * 80)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Main evaluation function."""
+    logging.basicConfig(
+        level=LOG_LEVEL,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
     )
-    df.index.names = ['agents_num', 'repeat']
-    df.reset_index(inplace=True)
-    df.to_csv(final_name + '.csv', index=False)
-except Exception as e:
-    logger.error(f"An error occurred: {e}", exc_info=True)
-finally:
-    ray.shutdown()
+
+    args = parse_args(argv)
+    try:
+        evaluator = Evaluator(args)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return 1
+
+    return evaluator.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -58,5 +58,3 @@ logging:
 # Evaluation settings (custom fields)
 eval_agents_range: "10-20"
 eval_video_fps: 10
-eval_smooth_motion: true
-eval_motion_frames: 5

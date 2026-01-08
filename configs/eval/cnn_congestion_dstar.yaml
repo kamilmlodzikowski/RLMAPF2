@@ -54,7 +54,7 @@ environment:
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:
-    grid_1-100a-20x23: null
+    maze1_1-100a-30x30: null
 logging:
   log_git_info: true
 eval_agents_range: "10-20"

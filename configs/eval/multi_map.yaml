@@ -45,24 +45,29 @@ environment:
   maps_names_with_variants:
     big_empty_1-100a-20x20: null  # Will be overridden by eval_maps
 
+eval_sync_train_config: true  # auto-sync eval env/model with the checkpoint's training config
+
 # Multi-map evaluation configuration
 eval_maps:
   enabled: true
   maps:
-    - name: big_empty_1-100a-20x20
+    - name: slots_10-10a-39x29
       variants: null
-      label: "Empty 20x20"
+      label: "slots_10"
     - name: pprai_1-20a-42x39
       variants: null
       label: "Warehouse"
-    - name: corridors_10-10a-32x32
+    - name: big_empty_1-100a-20x20
       variants: null
-      label: "Corridors"
+      label: "Basic1"
+    - name: box_4-4a-10x8
+      variants: null
+      label: "Box_4"
   aggregate_results: true
   generate_comparison_plots: true
 
 # Evaluation parameters
-eval_agents_range: "4-10"
+eval_agents_range: "1-20"
 eval_repeats: 10
 eval_num_threads: 2
 eval_video_fps: 10

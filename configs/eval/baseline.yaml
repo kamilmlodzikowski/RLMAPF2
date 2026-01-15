@@ -48,7 +48,7 @@ environment:
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:
-    maze4_1-100a-30x30.: null
+    maze4_1-100a-30x30: null
 logging:
   log_git_info: true
 # Evaluation settings (custom fields)

@@ -36,6 +36,8 @@ from plots import (
     plot_cross_map_comparison,
     plot_deadlock_vs_agents,
     plot_efficiency_vs_agents,
+    plot_goal_completion_boxplot,
+    plot_goal_completion_heatmap_detailed,
     plot_maps_success_heatmap,
     plot_success_vs_agents,
     plot_throughput_vs_agents,
@@ -45,6 +47,10 @@ from plots import (
     plot_tradeoff_efficiency_vs_collisions,
     plot_goal_completion_heatmap,
     plot_wait_fraction_vs_agents,
+    plot_wait_fraction_vs_agents_extra,
+    plot_steps_to_half_completion_vs_agents,
+    plot_progress_rate_vs_agents,
+    plot_collision_diagnostic_hist,
     create_cross_map_summary,
 )
 
@@ -471,14 +477,18 @@ def apply_overrides(config: Dict[str, Any], overrides: List[str]) -> Dict[str, A
 
         current = config
         for key in keys[:-1]:
-            if key not in current:
+            # Ensure nested containers exist (and reset non-dicts like None) so we can assign deeper keys.
+            if key not in current or current[key] is None or not isinstance(current[key], dict):
                 current[key] = {}
             current = current[key]
 
         final_key = keys[-1]
         try:
-            if value.lower() in ("true", "false"):
-                current[final_key] = value.lower() == "true"
+            lower_val = value.lower()
+            if lower_val in ("none", "null"):
+                current[final_key] = None
+            elif lower_val in ("true", "false"):
+                current[final_key] = lower_val == "true"
             elif "." in value:
                 current[final_key] = float(value)
             else:
@@ -1736,7 +1746,13 @@ class Evaluator:
             plot_collisions_vs_agents(episodes_df, plots_dir)
             plot_efficiency_vs_agents(episodes_df, plots_dir)
             plot_wait_fraction_vs_agents(episodes_df, plots_dir)
+            plot_wait_fraction_vs_agents_extra(episodes_df, plots_dir)
             plot_makespan_vs_agents(episodes_df, plots_dir)
+            plot_goal_completion_boxplot(episodes_df, plots_dir)
+            plot_goal_completion_heatmap_detailed(episodes_df, plots_dir)
+            plot_steps_to_half_completion_vs_agents(episodes_df, plots_dir)
+            plot_progress_rate_vs_agents(episodes_df, plots_dir)
+            plot_collision_diagnostic_hist(episodes_df, plots_dir)
             plot_dashboard_reliability(episodes_df, plots_dir)
             plot_dashboard_behavior(episodes_df, plots_dir)
             plot_goal_completion_heatmap(episodes_df, plots_dir)

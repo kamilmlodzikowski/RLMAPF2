@@ -13,6 +13,26 @@ import pandas as pd
 logger = logging.getLogger("eval")
 
 
+def _find_column(df: pd.DataFrame, aliases, label: str) -> Optional[str]:
+    """Return first matching column name or warn and return None."""
+    for col in aliases:
+        if col in df.columns:
+            return col
+    logger.warning("%s missing; skipping plot", label)
+    return None
+
+
+def _compute_yerr(mean: pd.Series, ci: pd.Series, clip_range: Optional[tuple[float, float]] = None):
+    """Return symmetric or asymmetric yerr, optionally clipped to bounds."""
+    if clip_range is None:
+        return ci
+    lower = (mean - ci).clip(lower=clip_range[0])
+    upper = (mean + ci).clip(upper=clip_range[1])
+    yerr_lower = mean - lower
+    yerr_upper = upper - mean
+    return np.vstack([yerr_lower, yerr_upper])
+
+
 def _line_with_ci(
     df: pd.DataFrame,
     x_col: str,
@@ -25,9 +45,11 @@ def _line_with_ci(
     if df.empty or y_col not in df.columns:
         return
     grouped = df.groupby(x_col)[y_col].agg(["mean", "count", "std"]).reset_index()
+    grouped["std"] = grouped["std"].fillna(0.0)
     grouped["ci"] = 1.96 * grouped["std"] / grouped["count"].clip(lower=1) ** 0.5
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.errorbar(grouped[x_col], grouped["mean"], yerr=grouped["ci"], fmt="-o", capsize=3)
+    yerr = _compute_yerr(grouped["mean"], grouped["ci"], clip_range=y_lim)
+    ax.errorbar(grouped[x_col], grouped["mean"], yerr=yerr, fmt="-o", capsize=3)
     ax.set_xlabel("Number of agents")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -47,8 +69,10 @@ def _multiline_with_ci(df: pd.DataFrame, x_col: str, series: Dict[str, str], out
         if col not in df.columns:
             continue
         grouped = df.groupby(x_col)[col].agg(["mean", "count", "std"]).reset_index()
+        grouped["std"] = grouped["std"].fillna(0.0)
         grouped["ci"] = 1.96 * grouped["std"] / grouped["count"].clip(lower=1) ** 0.5
-        ax.errorbar(grouped[x_col], grouped["mean"], yerr=grouped["ci"], fmt="-o", capsize=3, label=label)
+        yerr = _compute_yerr(grouped["mean"], grouped["ci"], clip_range=None)
+        ax.errorbar(grouped[x_col], grouped["mean"], yerr=yerr, fmt="-o", capsize=3, label=label)
     ax.set_xlabel("Number of agents")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -65,6 +89,7 @@ def _aggregate_mean_ci(df: pd.DataFrame, x_col: str, y_col: str) -> Optional[pd.
     grouped = df[[x_col, y_col]].dropna().groupby(x_col)[y_col].agg(["mean", "count", "std"]).reset_index()
     if grouped.empty:
         return None
+    grouped["std"] = grouped["std"].fillna(0.0)
     grouped["ci"] = 1.96 * grouped["std"] / grouped["count"].clip(lower=1) ** 0.5
     return grouped
 
@@ -104,14 +129,16 @@ def plot_deadlock_vs_agents(df: pd.DataFrame, out_dir: Path) -> None:
     if "deadlock" not in df.columns:
         logger.warning("deadlock column missing; skipping deadlock plot")
         return
+    df = df.copy()
+    df["deadlock_rate_percent"] = df["deadlock"] * 100.0
     _line_with_ci(
         df,
         x_col="agents_num",
-        y_col="deadlock",
+        y_col="deadlock_rate_percent",
         out_path=out_dir / "timeout_or_deadlock_vs_agents.png",
         title="Deadlock/timeout vs agents",
-        ylabel="Deadlock/timeout rate",
-        y_lim=(0, 1),
+        ylabel="Deadlock/timeout rate (%)",
+        y_lim=(0, 100),
     )
 
 
@@ -271,13 +298,20 @@ def plot_makespan_vs_agents(df: pd.DataFrame, out_dir: Path) -> None:
     )
 
 
-def _plot_line_to_axis(ax, grouped: Optional[pd.DataFrame], title: str, ylabel: str) -> None:
+def _plot_line_to_axis(
+    ax,
+    grouped: Optional[pd.DataFrame],
+    title: str,
+    ylabel: str,
+    clip_range: Optional[tuple[float, float]] = None,
+) -> None:
     if grouped is None or grouped.empty:
         ax.text(0.5, 0.5, "No data", ha="center", va="center")
         ax.set_title(title)
         ax.axis("off")
         return
-    ax.errorbar(grouped.iloc[:, 0], grouped["mean"], yerr=grouped["ci"], fmt="-o", capsize=3)
+    yerr = _compute_yerr(grouped["mean"], grouped["ci"], clip_range=clip_range)
+    ax.errorbar(grouped.iloc[:, 0], grouped["mean"], yerr=yerr, fmt="-o", capsize=3)
     ax.set_title(title)
     ax.set_xlabel("Number of agents")
     ax.set_ylabel(ylabel)
@@ -303,13 +337,19 @@ def plot_dashboard_reliability(df: pd.DataFrame, out_dir: Path) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     # Success
     success_g = _aggregate_mean_ci(df, "agents_num", "goal_completion_rate_percent")
-    _plot_line_to_axis(axes[0, 0], success_g, "Success vs agents", "Success rate (%)")
+    _plot_line_to_axis(axes[0, 0], success_g, "Success vs agents", "Success rate (%)", clip_range=(0, 100))
     # Deadlock
     deadlock_col = "deadlock_rate_percent"
     if "deadlock" in df.columns:
         df[deadlock_col] = df["deadlock"] * 100.0
     deadlock_g = _aggregate_mean_ci(df, "agents_num", deadlock_col)
-    _plot_line_to_axis(axes[0, 1], deadlock_g, "Deadlock/timeout vs agents", "Deadlock/timeout rate (%)")
+    _plot_line_to_axis(
+        axes[0, 1],
+        deadlock_g,
+        "Deadlock/timeout vs agents",
+        "Deadlock/timeout rate (%)",
+        clip_range=(0, 100),
+    )
     # Throughput
     throughput_g = _aggregate_mean_ci(df, "agents_num", throughput_col) if throughput_col else None
     _plot_line_to_axis(axes[1, 0], throughput_g, "Throughput vs agents", throughput_col.replace("_", " "))
@@ -419,6 +459,239 @@ def plot_goal_completion_heatmap(df: pd.DataFrame, out_dir: Path) -> None:
     cbar.set_label("Agents reached goal (avg)")
     plt.tight_layout()
     plt.savefig(out_dir / "goal_completion_heatmap.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+# --------------------------------------------------------------------------- #
+# Additional diagnostics
+# --------------------------------------------------------------------------- #
+
+def plot_goal_completion_boxplot(df: pd.DataFrame, out_dir: Path) -> None:
+    """Boxplot of goal completion percent per agent count."""
+    if df.empty or "agents_num" not in df.columns:
+        logger.warning("agents_num missing; skipping goal completion boxplot")
+        return
+    comp_col = _find_column(
+        df,
+        ["goal_completion_rate_percent", "goal_completion_percent", "goal_completion"],
+        "goal completion column",
+    )
+    if comp_col is None:
+        return
+
+    data = df[["agents_num", comp_col]].dropna()
+    if data.empty:
+        logger.warning("No data for goal completion boxplot")
+        return
+
+    agent_counts = sorted(data["agents_num"].unique())
+    positions = list(range(1, len(agent_counts) + 1))
+    grouped = [data.loc[data["agents_num"] == a, comp_col] for a in agent_counts]
+
+    fig, ax = plt.subplots(figsize=(max(7, len(agent_counts) * 0.35), 5))
+    ax.boxplot(grouped, positions=positions, patch_artist=True, showfliers=False)
+    tick_step = max(1, len(agent_counts) // 12)  # show up to ~12 ticks
+    tick_positions = positions[::tick_step]
+    tick_labels = [str(agent_counts[i - 1]) for i in tick_positions]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, rotation=0)
+    ax.set_xlabel("Number of agents")
+    ax.set_ylabel("Goal completion rate (%)")
+    ax.set_title("Goal completion distribution by agents")
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "goal_completion_boxplot.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_goal_completion_heatmap_detailed(df: pd.DataFrame, out_dir: Path) -> None:
+    """Heatmap of goal completion percent per repeat x agent count."""
+    if df.empty or "agents_num" not in df.columns:
+        logger.warning("agents_num missing; skipping detailed goal completion heatmap")
+        return
+    comp_col = _find_column(
+        df,
+        ["goal_completion_rate_percent", "goal_completion_percent", "goal_completion"],
+        "goal completion column",
+    )
+    if comp_col is None:
+        return
+
+    data = df[["agents_num", comp_col]].copy()
+    repeat_col = None
+    for candidate in ["repeat", "repeat_idx", "episode", "episode_idx"]:
+        if candidate in df.columns:
+            repeat_col = candidate
+            break
+    if repeat_col is None:
+        data["repeat_idx"] = df.groupby("agents_num").cumcount()
+    else:
+        data["repeat_idx"] = df[repeat_col]
+
+    pivot = data.pivot_table(index="repeat_idx", columns="agents_num", values=comp_col, aggfunc="mean")
+    if pivot.empty:
+        logger.warning("No data for detailed goal completion heatmap")
+        return
+
+    fig_w = max(6, 0.4 * pivot.shape[1] + 4)
+    fig_h = max(4, 0.3 * pivot.shape[0] + 2)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(pivot.values, aspect="auto", origin="lower", cmap="viridis")
+    ax.set_xticks(range(pivot.shape[1]))
+    ax.set_xticklabels([str(c) for c in pivot.columns])
+    ax.set_yticks(range(pivot.shape[0]))
+    ax.set_yticklabels([str(r) for r in pivot.index])
+    ax.set_xlabel("Number of agents")
+    ax.set_ylabel("Repeat")
+    ax.set_title("Goal completion per repeat")
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Goal completion rate (%)")
+    plt.tight_layout()
+    plt.savefig(out_dir / "goal_completion_heatmap_detailed.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_wait_fraction_vs_agents_extra(df: pd.DataFrame, out_dir: Path) -> None:
+    """Wait fraction vs agents with CI (alias-aware)."""
+    if df.empty or "agents_num" not in df.columns:
+        logger.warning("agents_num missing; skipping wait fraction plot")
+        return
+    wait_col = _find_column(
+        df,
+        ["wait_fraction", "wait_ratio", "frac_wait", "wait_frac"],
+        "wait fraction column",
+    )
+    if wait_col is None:
+        return
+    _line_with_ci(
+        df,
+        x_col="agents_num",
+        y_col=wait_col,
+        out_path=out_dir / "wait_fraction_vs_agents_extra.png",
+        title="Wait fraction vs agents (extra)",
+        ylabel="Wait fraction",
+        y_lim=(0, 1),
+    )
+
+
+def plot_steps_to_half_completion_vs_agents(df: pd.DataFrame, out_dir: Path) -> None:
+    """Steps to reach 50% completion vs agents with CI."""
+    if df.empty or "agents_num" not in df.columns:
+        logger.warning("agents_num missing; skipping steps-to-half plot")
+        return
+    steps_col = _find_column(
+        df,
+        ["steps_to_half_completion", "steps_to_50pct_completion", "half_completion_steps"],
+        "steps-to-half-completion column",
+    )
+    if steps_col is None:
+        return
+    _line_with_ci(
+        df,
+        x_col="agents_num",
+        y_col=steps_col,
+        out_path=out_dir / "steps_to_half_completion_vs_agents.png",
+        title="Steps to 50% completion vs agents",
+        ylabel="Steps to 50% completion",
+    )
+
+
+def plot_progress_rate_vs_agents(df: pd.DataFrame, out_dir: Path) -> None:
+    """Progress rate (completion percent per step) vs agents with CI."""
+    if df.empty or "agents_num" not in df.columns:
+        logger.warning("agents_num missing; skipping progress rate plot")
+        return
+    completion_col = _find_column(
+        df,
+        ["goal_completion_rate_percent", "goal_completion_percent", "goal_completion"],
+        "goal completion column",
+    )
+    length_col = _find_column(
+        df,
+        ["episode_length_steps", "episode_length", "episode_len", "steps", "timesteps"],
+        "episode length column",
+    )
+    if completion_col is None or length_col is None:
+        return
+    data = df[[completion_col, length_col, "agents_num"]].dropna()
+    if data.empty:
+        logger.warning("No data for progress rate plot")
+        return
+    data = data[data[length_col] > 0]
+    if data.empty:
+        logger.warning("Episode length zero; skipping progress rate plot")
+        return
+    data = data.copy()
+    data["progress_rate"] = data[completion_col] / data[length_col]
+    _line_with_ci(
+        data,
+        x_col="agents_num",
+        y_col="progress_rate",
+        out_path=out_dir / "progress_rate_vs_agents.png",
+        title="Progress rate vs agents",
+        ylabel="Completion percent per step",
+    )
+
+
+def plot_collision_diagnostic_hist(df: pd.DataFrame, out_dir: Path) -> None:
+    """Histogram of collisions per 1000 steps for representative agent counts."""
+    if df.empty or "agents_num" not in df.columns:
+        logger.warning("agents_num missing; skipping collision diagnostic histogram")
+        return
+    # Resolve collision metric
+    collision_col = None
+    for col in ["collisions_per_1000_steps", "total_collisions_per_1000", "collision_rate_1000"]:
+        if col in df.columns:
+            collision_col = col
+            break
+    if collision_col is None:
+        total_col = _find_column(df, ["total_collisions"], "total collisions column")
+        length_col = _find_column(
+            df,
+            ["episode_length_steps", "episode_length", "episode_len", "steps", "timesteps"],
+            "episode length column",
+        )
+        if total_col is None or length_col is None:
+            logger.warning("No collision data available; skipping collision diagnostic histogram")
+            return
+        df = df.copy()
+        df["collisions_per_1000_steps"] = df[total_col] / df[length_col].clip(lower=1) * 1000.0
+        collision_col = "collisions_per_1000_steps"
+
+    agent_counts = sorted(df["agents_num"].unique())
+    if not agent_counts:
+        logger.warning("No agent counts found for collision histogram")
+        return
+    selected = sorted({agent_counts[0], agent_counts[len(agent_counts) // 2], agent_counts[-1]})
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    has_any = False
+    for idx, agent in enumerate(selected):
+        vals = df.loc[df["agents_num"] == agent, collision_col].dropna()
+        if vals.empty:
+            continue
+        has_any = True
+        ax.hist(
+            vals,
+            bins=15,
+            alpha=0.4,
+            color=colors[idx % len(colors)],
+            label=f"{agent} agents",
+            edgecolor="black",
+        )
+    if not has_any:
+        logger.warning("No collision data to plot for selected agent counts")
+        plt.close(fig)
+        return
+
+    ax.set_xlabel("Collisions per 1000 steps")
+    ax.set_ylabel("Episode count")
+    ax.set_title("Collision diagnostic histogram")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "collision_diagnostic_hist.png", dpi=200, bbox_inches="tight")
     plt.close()
 
 

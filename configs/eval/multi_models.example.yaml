@@ -1,3 +1,5 @@
+maps: [maze1_1-100a-30x30]  # optional: global map override applied to all runs (variants = null)
+
 runs:
   - config: cnn
     checkpoint: 1            # numeric shortcut or full path
@@ -7,24 +9,49 @@ runs:
     num_threads: 2
     sync_train_config: true  # align env/model with checkpoint
     overrides:
-      - eval_agents_range=4-12
+      - eval_agents_range=1-20
     render_video: false
 
-  - config: baseline
-    checkpoint: experiments/train/baseline-20260107-044609-4687/checkpoints/baseline-20260107-044609-4687_final
-    name_suffix: baseline_final
+  - config: cnn_dispersal
+    checkpoint: 1
+    checkpoint_group: experiments/train/cnn_dispersal-20260115-030242-6738
+    name_suffix: cnn_dispersal
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true
     overrides:
-      - eval_agents_range=4-10
+      - eval_agents_range=1-20
     render_video: false
 
   - config: cnn_iterative_dstar
     checkpoint: 1
     checkpoint_group: experiments/train/cnn-iterative-dstar-20260107-220209-7787
-    name_suffix: dstar_best
+    name_suffix: cnn_iterative_dstar
     repeats: 5
     num_threads: 2
     sync_train_config: true
     overrides:
-      - eval_agents_range=6-14
-    success_threshold: 90
+      - eval_agents_range=1-20
+    render_video: false
+
+  - config: cnn_periphery
+    checkpoint: 1            # numeric shortcut or full path
+    checkpoint_group: experiments/train/cnn-periphery-20260114-014525-0512
+    name_suffix: cnn_periphery   # appended to run-name if run_name not set
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true  # align env/model with checkpoint
+    overrides:
+      - eval_agents_range=1-20
+    render_video: false
+
+  - config: cnn_congestion_dstar
+    checkpoint: 1            # numeric shortcut or full path
+    checkpoint_group: experiments/train/cnn-congestion-dstar-20260114-023141-0201
+    name_suffix: cnn_congestion_dstar   # appended to run-name if run_name not set
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true  # align env/model with checkpoint
+    overrides:
+      - eval_agents_range=1-20
     render_video: false

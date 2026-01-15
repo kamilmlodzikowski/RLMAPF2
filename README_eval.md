@@ -142,6 +142,10 @@ python eval.py --config baseline --checkpoint 1 \
 # Multi-map evaluation (iterates over multiple layouts)
 python eval.py --config multi_map --checkpoint 1 \
     --set eval_agents_range=4-10 --repeats 5 --num-threads 2
+
+# Multi-model evaluation (runs multiple configs and aggregates comparisons)
+python eval_multi.py configs/eval/multi_models.example.yaml \
+    --output-root experiments/eval/multi_model
 ```
 
 ## Notes

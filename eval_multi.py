@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import matplotlib.pyplot as plt
 import pandas as pd
 import yaml
+import numpy as np
 
 
 def _load_spec(path: Path) -> Dict[str, Any]:
@@ -32,7 +33,12 @@ def _ensure_list(val: Any) -> List[str]:
     return [str(val)]
 
 
-def _build_args(entry: Dict[str, Any], ts: str, results_dir: Optional[Path]) -> List[str]:
+def _build_args(
+    entry: Dict[str, Any],
+    ts: str,
+    results_dir: Optional[Path],
+    global_maps: Optional[List[str]] = None,
+) -> List[str]:
     required = ["config", "checkpoint"]
     for key in required:
         if key not in entry:
@@ -65,6 +71,15 @@ def _build_args(entry: Dict[str, Any], ts: str, results_dir: Optional[Path]) -> 
     if results_dir:
         args += ["--results-dir", str(results_dir)]
 
+    maps = entry.get("maps") or entry.get("map_overrides") or global_maps
+    if maps:
+        if isinstance(maps, (str, Path)):
+            maps = [str(maps)]
+        # Clear existing map list, then set overrides
+        args += ["--set", "environment.maps_names_with_variants=null"]
+        for m in maps:
+            args += ["--set", f"environment.maps_names_with_variants.{m}=null"]
+
     overrides = _ensure_list(entry.get("overrides"))
     for ov in overrides:
         args += ["--set", ov]
@@ -79,7 +94,7 @@ def _build_args(entry: Dict[str, Any], ts: str, results_dir: Optional[Path]) -> 
     return args
 
 
-def _aggregate_models(model_summaries: Dict[str, Path], output_dir: Path) -> None:
+def _aggregate_models(model_summaries: Dict[str, Path], output_dir: Path, model_results: Optional[Dict[str, Path]] = None) -> None:
     if len(model_summaries) < 2:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -135,10 +150,194 @@ def _aggregate_models(model_summaries: Dict[str, Path], output_dir: Path) -> Non
         ax.set_ylabel(title)
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
-        if idx == 0:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
             ax.legend()
     plt.tight_layout()
     plt.savefig(output_dir / "cross_model_comparison.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
+    if model_results:
+        _plot_cross_model_diagnostics(model_results, output_dir)
+
+
+def _find_column(df: pd.DataFrame, aliases) -> Optional[str]:
+    for col in aliases:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _agg_mean_ci(df: pd.DataFrame, value_col: str) -> Optional[pd.DataFrame]:
+    if "agents_num" not in df.columns or value_col not in df.columns:
+        return None
+    grouped = df[["agents_num", value_col]].dropna().groupby("agents_num")[value_col].agg(["mean", "count", "std"]).reset_index()
+    if grouped.empty:
+        return None
+    grouped["std"] = grouped["std"].fillna(0.0)
+    grouped["ci"] = 1.96 * grouped["std"] / grouped["count"].clip(lower=1) ** 0.5
+    return grouped
+
+
+def _plot_cross_model_diagnostics(model_results: Dict[str, Path], output_dir: Path) -> None:
+    """Diagnostic 4-up figure for cross-model evaluation."""
+    frames = []
+    for label, path in model_results.items():
+        if path and Path(path).exists():
+            df = pd.read_csv(path)
+            if df.empty:
+                continue
+            df = df.copy()
+            df["model"] = label
+            frames.append(df)
+    if not frames:
+        print("No final_results.csv found for cross-model diagnostics")
+        return
+    data = pd.concat(frames, ignore_index=True)
+    if data.empty:
+        print("No data available for cross-model diagnostics")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.flatten()
+
+    comp_col = _find_column(data, ["goal_completion_rate_percent", "goal_completion_percent", "goal_completion"])
+
+    # Goal completion heatmap (rows = model-repeat, cols = agents)
+    ax = axes[0]
+    if comp_col and "agents_num" in data.columns:
+        heat_df = data[["agents_num", comp_col, "model"]].dropna()
+        repeat_col = _find_column(data, ["repeat", "repeat_idx", "episode", "episode_idx"])
+        if repeat_col is None:
+            heat_df["repeat_idx"] = heat_df.groupby(["model", "agents_num"]).cumcount()
+        else:
+            heat_df["repeat_idx"] = data.loc[heat_df.index, repeat_col]
+        heat_df["row_id"] = heat_df["model"].astype(str) + "_r" + heat_df["repeat_idx"].astype(str)
+        pivot = heat_df.pivot_table(index="row_id", columns="agents_num", values=comp_col, aggfunc="mean")
+        if pivot.empty:
+            ax.text(0.5, 0.5, "No heatmap data", ha="center", va="center")
+            ax.axis("off")
+        else:
+            im = ax.imshow(pivot.values, aspect="auto", origin="lower", cmap="viridis")
+            ax.set_xticks(range(pivot.shape[1]))
+            ax.set_xticklabels([str(c) for c in pivot.columns])
+            ax.set_yticks(range(pivot.shape[0]))
+            ax.set_yticklabels(pivot.index)
+            ax.set_xlabel("Number of agents")
+            ax.set_ylabel("Model/repeat")
+            ax.set_title("Goal completion heatmap")
+            cbar = plt.colorbar(im, ax=ax)
+            cbar.set_label("Goal completion rate (%)")
+    else:
+        ax.text(0.5, 0.5, "Goal completion data missing", ha="center", va="center")
+        ax.axis("off")
+
+    # Wait fraction vs agents
+    ax = axes[1]
+    wait_col = _find_column(data, ["wait_fraction", "wait_ratio", "frac_wait", "wait_frac"])
+    if wait_col and "agents_num" in data.columns:
+        has_any = False
+        for model, df_m in data.groupby("model"):
+            agg = _agg_mean_ci(df_m, wait_col)
+            if agg is None:
+                continue
+            has_any = True
+            ax.plot(agg["agents_num"], agg["mean"], marker="o", label=model)
+            ax.fill_between(
+                agg["agents_num"],
+                agg["mean"] - agg["ci"],
+                agg["mean"] + agg["ci"],
+                alpha=0.15,
+            )
+        if has_any:
+            ax.set_xlabel("Number of agents")
+            ax.set_ylabel("Wait fraction")
+            ax.set_title("Wait fraction vs agents")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+        else:
+            ax.text(0.5, 0.5, "No wait fraction data", ha="center", va="center")
+            ax.axis("off")
+    else:
+        ax.text(0.5, 0.5, "Wait fraction data missing", ha="center", va="center")
+        ax.axis("off")
+
+    # Steps to 50% completion
+    ax = axes[2]
+    steps_col = _find_column(
+        data,
+        ["steps_to_half_completion", "steps_to_50pct_completion", "half_completion_steps"],
+    )
+    if steps_col and "agents_num" in data.columns:
+        has_any = False
+        for model, df_m in data.groupby("model"):
+            agg = _agg_mean_ci(df_m, steps_col)
+            if agg is None:
+                continue
+            has_any = True
+            ax.plot(agg["agents_num"], agg["mean"], marker="o", label=model)
+            ax.fill_between(
+                agg["agents_num"],
+                agg["mean"] - agg["ci"],
+                agg["mean"] + agg["ci"],
+                alpha=0.15,
+            )
+        if has_any:
+            ax.set_xlabel("Number of agents")
+            ax.set_ylabel("Steps to 50% completion")
+            ax.set_title("Steps to 50% completion vs agents")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+        else:
+            ax.text(0.5, 0.5, "No steps-to-half data", ha="center", va="center")
+            ax.axis("off")
+    else:
+        ax.text(0.5, 0.5, "Steps-to-half data missing", ha="center", va="center")
+        ax.axis("off")
+
+    # Progress rate vs agents
+    ax = axes[3]
+    length_col = _find_column(
+        data,
+        ["episode_length_steps", "episode_length", "episode_len", "steps", "timesteps"],
+    )
+    if comp_col and length_col and "agents_num" in data.columns:
+        prog_data = data[[comp_col, length_col, "agents_num", "model"]].dropna()
+        prog_data = prog_data[prog_data[length_col] > 0]
+        if prog_data.empty:
+            ax.text(0.5, 0.5, "No progress data", ha="center", va="center")
+            ax.axis("off")
+        else:
+            has_any = False
+            prog_data = prog_data.copy()
+            prog_data["progress_rate"] = prog_data[comp_col] / prog_data[length_col]
+            for model, df_m in prog_data.groupby("model"):
+                agg = _agg_mean_ci(df_m, "progress_rate")
+                if agg is None:
+                    continue
+                has_any = True
+                ax.plot(agg["agents_num"], agg["mean"], marker="o", label=model)
+                ax.fill_between(
+                    agg["agents_num"],
+                    agg["mean"] - agg["ci"],
+                    agg["mean"] + agg["ci"],
+                    alpha=0.15,
+                )
+            if has_any:
+                ax.set_xlabel("Number of agents")
+                ax.set_ylabel("Completion percent per step")
+                ax.set_title("Progress rate vs agents")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+            else:
+                ax.text(0.5, 0.5, "No progress data", ha="center", va="center")
+                ax.axis("off")
+    else:
+        ax.text(0.5, 0.5, "Progress data missing", ha="center", va="center")
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "cross_model_diagnostics.png", dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -155,15 +354,17 @@ def main(argv: List[str]) -> int:
 
     spec_path = Path(args.spec).resolve()
     spec = _load_spec(spec_path)
+    global_maps = spec.get("maps") or spec.get("map_overrides")
     ts = time.strftime("%Y%m%d-%H%M%S")
     base_output = Path(args.output_root).resolve() / ts
     base_output.mkdir(parents=True, exist_ok=True)
 
     model_summaries: Dict[str, Path] = {}
+    model_results: Dict[str, Path] = {}
     for idx, entry in enumerate(spec.get("runs", []), start=1):
         label = str(entry.get("name_suffix") or entry.get("run_name") or entry.get("config") or f"model_{idx}")
         results_dir = base_output / label
-        cmd = _build_args(entry, ts, results_dir)
+        cmd = _build_args(entry, ts, results_dir, global_maps=global_maps)
         print(f"[{idx}/{len(spec['runs'])}] Running: {' '.join(cmd)}")
         if args.dry_run:
             continue
@@ -173,8 +374,9 @@ def main(argv: List[str]) -> int:
             return result.returncode
         summary_path = results_dir / "summary.csv"
         model_summaries[label] = summary_path
+        model_results[label] = results_dir / "final_results.csv"
 
-    _aggregate_models(model_summaries, base_output / "cross_model_comparison")
+    _aggregate_models(model_summaries, base_output / "cross_model_comparison", model_results)
     return 0
 
 

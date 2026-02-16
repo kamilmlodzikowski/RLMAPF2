@@ -51,18 +51,18 @@ eval_sync_train_config: true  # auto-sync eval env/model with the checkpoint's t
 eval_maps:
   enabled: true
   maps:
-    - name: slots_10-10a-39x29
+    - name: basic3_1-100a-45x35
       variants: null
-      label: "slots_10"
+      label: "Basic3"
     - name: pprai_1-20a-42x39
       variants: null
       label: "Warehouse"
     - name: big_empty_1-100a-20x20
       variants: null
-      label: "Basic1"
-    - name: box_4-4a-10x8
+      label: "Big_empty"
+    - name: maze4_1-100a-30x30
       variants: null
-      label: "Box_4"
+      label: "Maze3"
   aggregate_results: true
   generate_comparison_plots: true
 
@@ -71,5 +71,5 @@ eval_agents_range: "1-20"
 eval_repeats: 10
 eval_num_threads: 2
 eval_video_fps: 10
-eval_smooth_motion: true  # Enable smooth agent motion in videos
+eval_smooth_motion: false  # Enable smooth agent motion in videos
 eval_motion_frames: 5     # Number of interpolation frames per step (higher = smoother but larger file)

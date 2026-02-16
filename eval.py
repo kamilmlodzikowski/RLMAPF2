@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 import re
 
 import numpy as np
+import math
 import pandas as pd
 import ray
 try:  # Ray versions prior to 2.7 don't expose this symbol
@@ -436,6 +437,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Comma-separated list or ranges of agent counts to render (e.g. '8,16,32-36').",
+    )
+    parser.add_argument(
+        "--video-once-per-agent",
+        action="store_true",
+        help="Render at most one video per agent count across repeats (default: render each repeat).",
+    )
+    parser.add_argument(
+        "--video-best-repeat-per-agent",
+        action="store_true",
+        help="Render only the best repeat for each agent count (implies one video per agent count).",
     )
     return parser.parse_args(argv)
 
@@ -1135,6 +1146,16 @@ class Evaluator:
         if self._render_video and args.repeats is None:
             self._repeats = 1
             logger.info("Video rendering enabled - setting repeats to 1 (override with --repeats if needed)")
+        self._video_once_per_agent = bool(
+            args.video_once_per_agent
+            or self._config.get('eval_video_once_per_agent', False)
+        )
+        self._video_best_repeat_per_agent = bool(
+            args.video_best_repeat_per_agent
+            or self._config.get('eval_video_best_repeat_per_agent', False)
+        )
+        if self._video_best_repeat_per_agent:
+            self._video_once_per_agent = True
 
         self._env_builder = EnvConfigBuilder(self._config)
         self._algo_factory = AlgorithmFactory(self._model_config, self._num_gpus)
@@ -1298,9 +1319,15 @@ class Evaluator:
         if self._render_video:
             if self._video_agent_selection:
                 selection_str = ", ".join(str(num) for num in sorted(self._video_agent_selection))
-                logger.info("Video rendering: ENABLED (only for agents: %s)", selection_str)
+                scope_note = "only for agents: %s" % selection_str
             else:
-                logger.info("Video rendering: ENABLED (for all agent counts)")
+                scope_note = "for all agent counts"
+            if self._video_best_repeat_per_agent:
+                logger.info("Video rendering: ENABLED (%s; one video per agent count, best repeat)", scope_note)
+            elif self._video_once_per_agent:
+                logger.info("Video rendering: ENABLED (%s; one video per agent count)", scope_note)
+            else:
+                logger.info("Video rendering: ENABLED (%s)", scope_note)
         else:
             logger.info("Video rendering: DISABLED")
         logger.info("=" * 80)
@@ -1340,21 +1367,51 @@ class Evaluator:
 
     def _run_repeats_for_agent_count(self, map_spec: MapSpec, agents_num: int, results_dir: Path) -> List[EpisodeResult]:
         results: List[EpisodeResult] = []
+        render_during_repeats = self._render_video and not self._video_best_repeat_per_agent
+        video_repeat = None
+        if render_during_repeats:
+            selection_allows_video = self._video_agent_selection is None or agents_num in self._video_agent_selection
+            if selection_allows_video and self._video_once_per_agent:
+                video_repeat = 0  # render using the first repeat for this agent count
         with ThreadPoolExecutor(max_workers=self._num_threads) as executor:
             futures = [
-                executor.submit(self._run_repeat, map_spec, agents_num, repeat, results_dir)
+                executor.submit(
+                    self._run_repeat,
+                    map_spec,
+                    agents_num,
+                    repeat,
+                    results_dir,
+                    video_repeat,
+                    disable_video=not render_during_repeats,
+                )
                 for repeat in range(self._repeats)
             ]
             for future in as_completed(futures):
                 results.append(future.result())
+        if self._render_video and self._video_best_repeat_per_agent:
+            best_repeat = self._select_best_repeat_for_agent(results, agents_num)
+            if best_repeat is not None:
+                self._render_best_repeat_video(map_spec, agents_num, best_repeat, results_dir)
         return results
 
-    def _run_repeat(self, map_spec: MapSpec, agents_num: int, repeat: int, results_dir: Path) -> EpisodeResult:
+    def _run_repeat(
+        self,
+        map_spec: MapSpec,
+        agents_num: int,
+        repeat: int,
+        results_dir: Path,
+        video_repeat: Optional[int] = None,
+        disable_video: bool = False,
+    ) -> EpisodeResult:
         logger.info("Evaluating with %d agents, repeat %d/%d", agents_num, repeat + 1, self._repeats)
 
-        should_render = self._render_video and (
-            self._video_agent_selection is None or agents_num in self._video_agent_selection
-        )
+        should_render = False
+        if not disable_video:
+            should_render = self._render_video and (
+                self._video_agent_selection is None or agents_num in self._video_agent_selection
+            )
+            if should_render and self._video_once_per_agent:
+                should_render = video_repeat is not None and repeat == video_repeat
 
         video_path = None
         if should_render:
@@ -1384,6 +1441,62 @@ class Evaluator:
             algorithm.stop()
 
         return result
+
+    def _select_best_repeat_for_agent(self, results: List[EpisodeResult], agents_num: int) -> Optional[int]:
+        agent_results = [r for r in results if r.agents_num == agents_num]
+        if not agent_results:
+            return None
+
+        def safe(val: Any, default: float = 0.0) -> float:
+            if val is None:
+                return default
+            try:
+                if isinstance(val, float) and math.isnan(val):
+                    return default
+                return float(val)
+            except (TypeError, ValueError):
+                return default
+
+        def score(result: EpisodeResult) -> Tuple:
+            return (
+                1 if result.success else 0,  # prefer successful episodes
+                safe(result.goal_completion_rate_percent),  # higher completion
+                -safe(result.collision_total_per_agent_step),  # fewer collisions
+                -safe(result.wait_fraction),  # less waiting
+                safe(result.throughput_goals_per_step),  # higher throughput
+                -safe(result.episode_length_steps),  # shorter episodes
+            )
+
+        best = max(agent_results, key=score)
+        logger.info(
+            "Selected best repeat for %d agents: repeat %d (score=%s)",
+            agents_num,
+            best.repeat,
+            score(best),
+        )
+        return int(best.repeat)
+
+    def _render_best_repeat_video(self, map_spec: MapSpec, agents_num: int, repeat: int, results_dir: Path) -> None:
+        logger.info("Rendering best repeat video for %d agents using repeat %d", agents_num, repeat)
+        video_filename = f"evaluation_{agents_num}agents_repeat{repeat}.mp4"
+        video_path = str(results_dir / video_filename)
+
+        env_config = self._env_builder.build(
+            agents_num=agents_num,
+            seed=42 + repeat,
+            render_video=False,
+            video_path=None,
+            render_mode="none",
+            map_spec=map_spec,
+        )
+
+        algorithm = self._algo_factory.build(env_config)
+        algorithm.restore(str(self._checkpoint_path))
+        policy = algorithm.get_policy()
+        try:
+            self._render_video_episode(policy, map_spec, agents_num, repeat, video_path)
+        finally:
+            algorithm.stop()
 
     def _render_video_episode(
         self,
@@ -1461,8 +1574,9 @@ class Evaluator:
 
         total_agents = env_config.get('agents_num', agents_num)
         half_threshold = max(1, int(np.ceil(total_agents * 0.5)))
+        agent_positions_dict = getattr(env, "agent_positions", {})
         agent_ids_for_counters = [
-            agent_id for agent_id in getattr(env, "agent_positions", {}).keys()
+            agent_id for agent_id in agent_positions_dict.keys()
             if agent_id != "__all__" and agent_id != "__common__"
         ]
         collision_counters = {
@@ -1470,15 +1584,20 @@ class Evaluator:
             for agent_id in agent_ids_for_counters
         }
 
+        supports_positions = hasattr(env, "agent_positions")
         prev_positions: Dict[str, Tuple[int, int]] = {}
+        if supports_positions:
+            for agent_id in agent_ids_for_counters:
+                pos = env.agent_positions.get(agent_id)
+                if pos is not None:
+                    prev_positions[agent_id] = tuple(pos)
 
         while not done and step_count < max_steps:
-            if hasattr(env, 'agent_positions'):
-                prev_positions = {
-                    agent_id: tuple(env.agent_positions[agent_id])
-                    for agent_id in obs.keys()
-                    if agent_id in env.agent_positions
-                }
+            if supports_positions:
+                for agent_id in agent_ids_for_counters:
+                    pos = env.agent_positions.get(agent_id)
+                    if pos is not None:
+                        prev_positions[agent_id] = tuple(pos)
 
             actions = {}
             intended_positions = {}
@@ -1506,34 +1625,62 @@ class Evaluator:
                         half_completion_step = step_count
 
             collision_deltas = {}
-            for agent_id in collision_counters.keys():
-                new_count = info.get(agent_id, {}).get("number_of_collisions", collision_counters[agent_id])
-                delta = new_count - collision_counters[agent_id]
-                if delta > 0:
-                    collision_deltas[agent_id] = delta
-                collision_counters[agent_id] = new_count
+            info_dict = info if isinstance(info, dict) else {}
+            if collision_counters and info_dict:
+                for agent_id, agent_info in info_dict.items():
+                    if agent_id not in collision_counters:
+                        continue
+                    prev_count = collision_counters[agent_id]
+                    new_count = agent_info.get("number_of_collisions", prev_count)
+                    delta = new_count - prev_count
+                    if delta > 0:
+                        collision_deltas[agent_id] = delta
+                    collision_counters[agent_id] = new_count
 
             if collision_deltas:
+                collision_agents = list(collision_deltas.keys())
+                intended_subset = {agent_id: intended_positions.get(agent_id) for agent_id in collision_agents}
+                prev_subset = {agent_id: prev_positions.get(agent_id) for agent_id in collision_agents}
+                actions_subset = {agent_id: actions.get(agent_id, 4) for agent_id in collision_agents}
+
+                intended_pos_to_agents: Dict[Tuple[int, int], List[str]] = defaultdict(list)
+                prev_pos_to_agents: Dict[Tuple[int, int], List[str]] = defaultdict(list)
+                waiting_prev_positions: Dict[Tuple[int, int], List[str]] = defaultdict(list)
+
+                for agent_id in collision_agents:
+                    intended_pos = intended_subset.get(agent_id)
+                    prev_pos = prev_subset.get(agent_id)
+                    if intended_pos is not None:
+                        intended_pos_to_agents[intended_pos].append(agent_id)
+                    if prev_pos is not None:
+                        prev_pos_to_agents[prev_pos].append(agent_id)
+                        if actions_subset.get(agent_id, 4) == 4:
+                            waiting_prev_positions[prev_pos].append(agent_id)
+
                 for agent_id, delta in collision_deltas.items():
+                    intended_pos = intended_subset.get(agent_id)
+                    prev_pos = prev_subset.get(agent_id)
+
+                    # Multiple agents moving into the same cell
+                    if intended_pos is not None and len(intended_pos_to_agents.get(intended_pos, [])) > 1:
+                        agent_agent_collision_total += delta
+                        continue
+
                     is_agent_collision = False
-                    for other_id in collision_deltas.keys():
-                        if other_id == agent_id:
-                            continue
-                        if intended_positions.get(agent_id) == intended_positions.get(other_id):
-                            is_agent_collision = True
-                            break
-                        if (
-                            intended_positions.get(agent_id) == prev_positions.get(other_id)
-                            and intended_positions.get(other_id) == prev_positions.get(agent_id)
-                        ):
-                            is_agent_collision = True
-                            break
-                        if (
-                            intended_positions.get(agent_id) == prev_positions.get(other_id)
-                            and actions.get(other_id, 4) == 4
-                        ):
-                            is_agent_collision = True
-                            break
+                    if intended_pos is not None and prev_pos is not None:
+                        # Swap positions check
+                        for other_id in prev_pos_to_agents.get(intended_pos, []):
+                            if other_id == agent_id:
+                                continue
+                            if intended_subset.get(other_id) == prev_pos:
+                                is_agent_collision = True
+                                break
+                        # Moving into a waiting agent's cell
+                        if not is_agent_collision:
+                            waiting_agents = waiting_prev_positions.get(intended_pos, [])
+                            if any(other_id != agent_id for other_id in waiting_agents):
+                                is_agent_collision = True
+
                     if is_agent_collision:
                         agent_agent_collision_total += delta
                     else:

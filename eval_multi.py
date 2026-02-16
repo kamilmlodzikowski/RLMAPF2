@@ -38,6 +38,8 @@ def _build_args(
     ts: str,
     results_dir: Optional[Path],
     global_maps: Optional[List[str]] = None,
+    global_video_once_per_agent: Optional[bool] = None,
+    global_video_best_repeat_per_agent: Optional[bool] = None,
 ) -> List[str]:
     required = ["config", "checkpoint"]
     for key in required:
@@ -59,6 +61,16 @@ def _build_args(
         args.append("--clamp-agents-to-train")
     if entry.get("render_video"):
         args.append("--render-video")
+    video_once_per_agent = entry.get("video_once_per_agent")
+    if video_once_per_agent is None:
+        video_once_per_agent = global_video_once_per_agent
+    if video_once_per_agent:
+        args.append("--video-once-per-agent")
+    video_best_repeat = entry.get("video_best_repeat_per_agent")
+    if video_best_repeat is None:
+        video_best_repeat = global_video_best_repeat_per_agent
+    if video_best_repeat:
+        args.append("--video-best-repeat-per-agent")
 
     if entry.get("video_agents"):
         args += ["--video-agents", str(entry["video_agents"])]
@@ -355,6 +367,8 @@ def main(argv: List[str]) -> int:
     spec_path = Path(args.spec).resolve()
     spec = _load_spec(spec_path)
     global_maps = spec.get("maps") or spec.get("map_overrides")
+    global_video_once_per_agent = spec.get("video_once_per_agent")
+    global_video_best_repeat_per_agent = spec.get("video_best_repeat_per_agent")
     ts = time.strftime("%Y%m%d-%H%M%S")
     base_output = Path(args.output_root).resolve() / ts
     base_output.mkdir(parents=True, exist_ok=True)
@@ -364,7 +378,14 @@ def main(argv: List[str]) -> int:
     for idx, entry in enumerate(spec.get("runs", []), start=1):
         label = str(entry.get("name_suffix") or entry.get("run_name") or entry.get("config") or f"model_{idx}")
         results_dir = base_output / label
-        cmd = _build_args(entry, ts, results_dir, global_maps=global_maps)
+        cmd = _build_args(
+            entry,
+            ts,
+            results_dir,
+            global_maps=global_maps,
+            global_video_once_per_agent=global_video_once_per_agent,
+            global_video_best_repeat_per_agent=global_video_best_repeat_per_agent,
+        )
         print(f"[{idx}/{len(spec['runs'])}] Running: {' '.join(cmd)}")
         if args.dry_run:
             continue

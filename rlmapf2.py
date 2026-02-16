@@ -234,7 +234,7 @@ class RLMAPF(MultiAgentEnv):
     def _assign_periphery_positions(self):
         max_x = self.grid_size[0] - 1
         max_y = self.grid_size[1] - 1
-        candidates = []
+        candidates: List[Tuple[int, int]] = []
         for x in range(self.grid_size[0]):
             for y in range(self.grid_size[1]):
                 pos = (x, y)
@@ -249,11 +249,42 @@ class RLMAPF(MultiAgentEnv):
 
         required_agents = len(self._agent_ids)
         if len(candidates) < required_agents:
-            raise ValueError(
-                "Not enough obstacle-free periphery cells ({}) to place {} agents with mirrored goals.".format(
-                    len(candidates), required_agents
+            # Broaden search to any mirrored free cells (not only the periphery).
+            seen_pairs = set()
+            expanded_candidates: List[Tuple[int, int]] = []
+            for x in range(self.grid_size[0]):
+                for y in range(self.grid_size[1]):
+                    pos = (x, y)
+                    goal = (max_x - x, max_y - y)
+                    if pos in self.obstacles or goal in self.obstacles:
+                        continue
+                    pair_key = tuple(sorted([pos, goal]))
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+                    expanded_candidates.append(pos)
+
+            # Keep existing periphery picks but allow interior mirrored cells
+            merged_candidates = candidates + [c for c in expanded_candidates if c not in candidates]
+
+            if len(merged_candidates) < required_agents:
+                print(
+                    "[RLMAPF] Warning: map '{}' has {} mirrored free cells; "
+                    "need {}. Falling back to default start/goal assignment.".format(
+                        self.get_current_map_name() or "unknown",
+                        len(merged_candidates),
+                        required_agents,
+                    )
+                )
+                self._prepare_positions_for_agents()
+                return
+            print(
+                "[RLMAPF] Warning: insufficient periphery cells on map '{}'; "
+                "using mirrored interior cells for start/goal placement.".format(
+                    self.get_current_map_name() or "unknown"
                 )
             )
+            candidates = merged_candidates
 
         candidates = np.array(candidates, dtype=int)
         np.random.shuffle(candidates)
@@ -265,6 +296,45 @@ class RLMAPF(MultiAgentEnv):
             goal = (max_x - start[0], max_y - start[1])
             self.agent_positions[agent] = start
             self.goal_positions[agent] = goal
+
+    def _prepare_positions_for_agents(self) -> None:
+        """
+        Normalize map-defined start/goal positions to the configured agent ids
+        and backfill any missing pairs with random free cells.
+        """
+        def _agent_idx(agent_label: Any) -> int:
+            try:
+                return int(str(agent_label).split("_")[-1])
+            except (ValueError, IndexError):
+                try:
+                    return int(agent_label)
+                except (ValueError, TypeError):
+                    return 0
+
+        agent_ids = sorted(self._agent_ids, key=_agent_idx)
+
+        map_keys = set(self.agent_positions.keys()) | set(self.goal_positions.keys())
+        ordered_keys = sorted(map_keys, key=_agent_idx)
+        paired_positions: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        for key in ordered_keys:
+            start = self.agent_positions.get(key)
+            goal = self.goal_positions.get(key)
+            if start is None or goal is None:
+                continue
+            paired_positions.append((tuple(start), tuple(goal)))
+
+        self.agent_positions = {}
+        self.goal_positions = {}
+        for idx, agent in enumerate(agent_ids):
+            if idx < len(paired_positions):
+                start_pos, goal_pos = paired_positions[idx]
+                self.agent_positions[agent] = start_pos
+                self.goal_positions[agent] = goal_pos
+            else:
+                start_pos = self._random_pos()
+                self.agent_positions[agent] = start_pos
+                goal_pos = self._random_pos()
+                self.goal_positions[agent] = goal_pos
 
     def _init_path_styles(self):
         """Assign random colors and linestyles per agent for D* Lite path rendering."""
@@ -395,15 +465,8 @@ class RLMAPF(MultiAgentEnv):
         if self.start_goal_on_periphery:
             self._assign_periphery_positions()
         else:
-            # Generate random agent positions if empty
-            if len(self.agent_positions) == 0:
-                for agent in self._agent_ids:
-                    self.agent_positions[agent] = self._random_pos()
-
-            # Generate random goal positions if empty
-            if len(self.goal_positions) == 0:
-                for agent in self._agent_ids:
-                    self.goal_positions[agent] = self._random_pos()
+            # Align map-provided positions to current agent ids and fill any gaps.
+            self._prepare_positions_for_agents()
 
         # Precompute static obstacle grid for faster cropping
         obstacles_array = np.zeros(self.grid_size, dtype=np.float32)

@@ -53,6 +53,7 @@ environment:
   render_delay: 0.01
   maps_names_with_variants:
     maze1_1-100a-30x30: null
+eval_sync_train_config: true  # auto-sync env/model with checkpoint training config
 logging:
   log_git_info: true
 # Evaluation settings (custom fields)

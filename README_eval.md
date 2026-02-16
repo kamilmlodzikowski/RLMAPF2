@@ -46,6 +46,8 @@ python eval.py \
 - `--render-video` - Enable video generation
 - `--video-agents LIST` - Comma-separated numbers and/or ranges (e.g. `12,16-20`) that should get videos
   when `--render-video` is set. Default: all agent counts in the evaluation range.
+- `--video-once-per-agent` - When rendering, save at most one video per agent count (instead of one per repeat).
+- `--video-best-repeat-per-agent` - Render only a single video for each agent count, choosing the best repeat (ties broken by completion, collisions, wait, throughput, length).
 - `--repeats N` - Number of evaluation repeats (default: from config)
 - `--num-threads N` - Parallel evaluation threads (default: 1)
 - `--set KEY=VALUE` - Override config values
@@ -139,9 +141,8 @@ python eval.py --config baseline --checkpoint 1
 python eval.py --config baseline --checkpoint 1 \
     --checkpoint-strategy latest
 
-# Multi-map evaluation (iterates over multiple layouts)
-python eval.py --config multi_map --checkpoint 1 \
-    --set eval_agents_range=4-10 --repeats 5 --num-threads 2
+# Multi-map evaluation (baseline; swap baseline→cnn to change model)
+python eval.py --config multi_map --checkpoint 1 --checkpoint-group baseline --checkpoint-strategy best --set eval_agents_range=4-10 --repeats 5 --num-threads 2
 
 # Multi-model evaluation (runs multiple configs and aggregates comparisons)
 python eval_multi.py configs/eval/multi_models.example.yaml \
@@ -160,6 +161,11 @@ python eval_multi.py configs/eval/multi_models.example.yaml \
 - Use `--video-agents N` to render only specific agent count
 - Results include git commit hash for reproducibility
 - **Multi-map runs**: enable via `eval_maps.enabled: true` in the config. Each map gets its own `map_<label>/` folder plus a `cross_map_comparison/` directory with aggregated plots and CSVs. Use a low-cost smoke test (e.g., `--set eval_agents_range=4-4 --repeats 1`) before launching long sweeps. The default multi_map config auto-syncs env/model with the checkpoint (`eval_sync_train_config: true`) so CNN/baseline/D* runs load cleanly.
+- **Choosing model for multi_map**: keep `eval_sync_train_config: true` (default) and pick the run you want via `--checkpoint-group` plus the numeric `--checkpoint`. Example: baseline run → `python eval.py --config multi_map --checkpoint 1 --checkpoint-group baseline`; CNN run → `python eval.py --config multi_map --checkpoint 1 --checkpoint-group cnn`. If you need to force a custom model block from `configs/eval/multi_map.yaml`, set `--set eval_sync_train_config=false`, edit the `model` (and matching `environment` flags like `use_cnn_observation`), and ensure the checkpoint was trained with that architecture or restore will fail.
+- One-line multi-map command (baseline; swap `baseline`→`cnn` to eval the CNN run):
+  ```bash
+  python eval.py --config multi_map --checkpoint 1 --checkpoint-group baseline --checkpoint-strategy best --set eval_agents_range=4-10 --repeats 5 --num-threads 2
+  ```
 
 ## Metrics Cheat Sheet (How to Read Plots/CSVs)
 

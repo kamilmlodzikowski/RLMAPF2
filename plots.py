@@ -12,6 +12,12 @@ import pandas as pd
 
 logger = logging.getLogger("eval")
 
+def _legend_upper_left(ax):
+    """Place legend in the upper-left corner if entries exist."""
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="upper left", bbox_to_anchor=(0, 1))
+
 
 def _find_column(df: pd.DataFrame, aliases, label: str) -> Optional[str]:
     """Return first matching column name or warn and return None."""
@@ -77,7 +83,7 @@ def _multiline_with_ci(df: pd.DataFrame, x_col: str, series: Dict[str, str], out
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    _legend_upper_left(ax)
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close()
@@ -207,7 +213,7 @@ def plot_collisions_vs_agents(df: pd.DataFrame, out_dir: Path) -> None:
     ax.set_ylabel("Collisions (normalized)")
     ax.set_title("Collisions vs agents")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    _legend_upper_left(ax)
     plt.tight_layout()
     plt.savefig(out_dir / "collisions_vs_agents.png", dpi=200, bbox_inches="tight")
     plt.close()
@@ -371,7 +377,7 @@ def plot_dashboard_reliability(df: pd.DataFrame, out_dir: Path) -> None:
         ax_ms.set_xlabel("Number of agents")
         ax_ms.set_ylabel("Steps")
         ax_ms.grid(True, alpha=0.3)
-        ax_ms.legend()
+        _legend_upper_left(ax_ms)
     else:
         ax_ms.text(0.5, 0.5, "No data", ha="center", va="center")
         ax_ms.axis("off")
@@ -688,7 +694,7 @@ def plot_collision_diagnostic_hist(df: pd.DataFrame, out_dir: Path) -> None:
     ax.set_xlabel("Collisions per 1000 steps")
     ax.set_ylabel("Episode count")
     ax.set_title("Collision diagnostic histogram")
-    ax.legend()
+    _legend_upper_left(ax)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_dir / "collision_diagnostic_hist.png", dpi=200, bbox_inches="tight")
@@ -748,35 +754,106 @@ def plot_maps_success_boxplot(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close()
 
 
+def _load_map_results(summary_path: Path) -> Optional[pd.DataFrame]:
+    """
+    Prefer detailed per-episode results when available (final_results.csv), so we can
+    compute deviation bands. Fallback to summary.csv if needed.
+    """
+    final_results = summary_path.parent / "final_results.csv"
+    try:
+        if final_results.exists():
+            return pd.read_csv(final_results)
+        if summary_path.exists():
+            return pd.read_csv(summary_path)
+    except Exception as exc:  # pragma: no cover - protective logging
+        logger.warning("Failed to read map results from %s: %s", summary_path, exc)
+    return None
+
+
+def _agg_mean_std(df: pd.DataFrame, x_col: str, y_col: str) -> Optional[pd.DataFrame]:
+    """Group by x and compute mean/std for y."""
+    if df.empty or x_col not in df.columns or y_col not in df.columns:
+        return None
+    grouped = df[[x_col, y_col]].dropna().groupby(x_col)[y_col].agg(["mean", "std"]).reset_index()
+    if grouped.empty:
+        return None
+    grouped["std"] = grouped["std"].fillna(0.0)
+    return grouped
+
+
 def plot_cross_map_comparison(map_summaries: Dict[str, Path], plots_dir: Path):
-    """Legacy cross-map comparison (line plots per map)."""
+    """
+    Cross-map comparison with deviation bands (±1 std); mean lines are suppressed to
+    emphasize variability, per user request.
+    """
     try:
         dfs = {}
         for label, summary_path in map_summaries.items():
-            if summary_path.exists():
-                dfs[label] = pd.read_csv(summary_path)
+            df = _load_map_results(summary_path)
+            if df is not None and not df.empty:
+                dfs[label] = df
+
         if len(dfs) < 2:
             logger.warning("Need at least 2 maps for cross-map comparison")
             return
+
         metrics = [
-            ("success_rate_percent", "Success rate (%)"),
-            ("deadlock_rate_percent", "Deadlock rate (%)"),
-            ("avg_success_length_steps", "Episode length (success)"),
-            ("avg_throughput_steps_per_sec", "Throughput (steps/s)"),
-            ("avg_collision_agent_agent_per_agent_step", "Agent–Agent collisions/agent-step"),
-            ("avg_collision_agent_obstacle_per_agent_step", "Agent–Obstacle collisions/agent-step"),
+            ("goal_completion_rate_percent", "Success rate (%)"),
+            ("deadlock", "Deadlock rate (%)"),  # will be scaled below
+            ("episode_length_steps", "Episode length (steps)"),
+            ("throughput_steps_per_sec", "Throughput (steps/s)"),
+            ("collision_agent_agent_per_agent_step", "Agent–Agent collisions/agent-step"),
+            ("collision_agent_obstacle_per_agent_step", "Agent–Obstacle collisions/agent-step"),
         ]
+
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         axes = axes.flatten()
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
         for idx, (metric, title) in enumerate(metrics):
-            for map_label, df in dfs.items():
-                if metric in df.columns:
-                    axes[idx].plot(df["agents_num"], df[metric], marker="o", linewidth=2, label=map_label)
-            axes[idx].set_xlabel("Number of agents")
-            axes[idx].set_ylabel(title)
-            axes[idx].set_title(title)
-            axes[idx].legend()
-            axes[idx].grid(True, alpha=0.3)
+            ax = axes[idx]
+            for color_idx, (map_label, df) in enumerate(dfs.items()):
+                plot_df = df.copy()
+                if metric == "deadlock" and "deadlock" in plot_df.columns:
+                    plot_df["deadlock_rate_percent"] = plot_df["deadlock"] * 100.0
+                    metric_col = "deadlock_rate_percent"
+                else:
+                    metric_col = metric
+
+                grouped = _agg_mean_std(plot_df, "agents_num", metric_col)
+                if grouped is None:
+                    continue
+
+                x_vals = grouped["agents_num"]
+                mean_vals = grouped["mean"]
+                std_vals = grouped["std"]
+                lower = (mean_vals - std_vals).clip(lower=0)
+                upper = (mean_vals + std_vals)
+
+                color = colors[color_idx % len(colors)]
+                ax.fill_between(
+                    x_vals,
+                    lower,
+                    upper,
+                    alpha=0.2,
+                    color=color,
+                    linewidth=0,
+                )
+                ax.plot(
+                    x_vals,
+                    mean_vals,
+                    color=color,
+                    linewidth=2,
+                    marker="o",
+                    label=map_label,
+                )
+
+            ax.set_xlabel("Number of agents")
+            ax.set_ylabel(title)
+            ax.set_title(title)
+            _legend_upper_left(ax)
+            ax.grid(True, alpha=0.3)
+
         plt.tight_layout()
         plt.savefig(plots_dir / "cross_map_comparison.png", dpi=300, bbox_inches="tight")
         plt.close()

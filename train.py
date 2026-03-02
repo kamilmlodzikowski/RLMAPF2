@@ -231,7 +231,7 @@ def build_run_name(config: TrainConfig, explicit_name: Optional[str]) -> str:
     return f"{config.run.name_prefix}-{timestamp}-{random_suffix}"
 
 
-def build_environment_config(config: TrainConfig, seed: Optional[int] = None) -> Dict[str, Any]:
+def build_environment_config(config: TrainConfig) -> Dict[str, Any]:
     env_config = dict(config.environment)
     env_config.setdefault("map_path", str(config.paths.map_root))
     if not env_config.get("maps_names_with_variants"):
@@ -263,21 +263,18 @@ def _generate_seed() -> int:
 def resolve_run_seeds(config: TrainConfig) -> Tuple[int, int, bool, bool]:
     explicit_train_seed = config.environment.get("seed")
     original_train_seed = config.training.random_seed
-    # Training seed is kept for reproducibility metadata only. We no
-    # longer push it into env_config unless the user also set
-    # environment.seed explicitly.
+    # Training seed is kept for reproducibility metadata; the env itself is only
+    # forced to this seed when environment.seed is explicitly set.
     if explicit_train_seed is not None:
         training_seed = int(explicit_train_seed)
         config.training.random_seed = training_seed
     else:
-        training_seed = None
-    # else:
-    #     training_seed = (
-    #         int(original_train_seed)
-    #         if original_train_seed is not None
-    #         else _generate_seed()
-    #     )
-    # config.training.random_seed = training_seed
+        training_seed = (
+            int(original_train_seed)
+            if original_train_seed is not None
+            else _generate_seed()
+        )
+        config.training.random_seed = training_seed
 
     explicit_eval_seed = config.evaluation_environment.get("seed")
     original_eval_seed = config.training.evaluation_seed
@@ -830,7 +827,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     logger.info("Ray initialized (dashboard: %s)", ray_context.dashboard_url)
 
-    env_config = build_environment_config(config, seed=train_seed)
+    env_config = build_environment_config(config)
     eval_env_config = (
         build_evaluation_env_config(config, seed=eval_seed)
         if config.training.evaluation_enabled
@@ -912,10 +909,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     metrics_handle.write(json.dumps(log_entry) + "\n")
                     metrics_handle.flush()
 
-                    print("-" * 40)
-                    print(f"Episode: {episode}")
+                    logger.info("-" * 40)
+                    logger.info("Episode: %s", episode)
                     for key, value in train_metrics.items():
-                        print(f"\t{key}: {value}")
+                        logger.info("  %s: %s", key, value)
 
                     eval_video_path: Optional[Path] = None
 
@@ -926,9 +923,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                             agents_num,
                         )
                         update_best_metrics(best_metrics, eval_metrics, episode)
-                        print("Evaluation metrics:")
+                        logger.info("Evaluation metrics:")
                         for key, value in eval_metrics.items():
-                            print(f"\t{key}: {value}")
+                            logger.info("  %s: %s", key, value)
                         train_metrics.update(eval_metrics)
                         if config.run.use_wandb and wandb_run is not None:
                             eval_run_component = f"{run_name}_eval_ep{episode}"
@@ -970,7 +967,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         if config.run.use_wandb and wandb_run is not None:
                             wandb_run.log({"checkpoints/latest": str(checkpoint_path)}, step=episode)
 
-                print("=" * 20, "Training finished", "=" * 20)
+                logger.info("%s Training finished %s", "=" * 20, "=" * 20)
                 final_checkpoint = checkpoint_dir / f"{run_name}_final"
                 algorithm.save(str(final_checkpoint))
                 logger.info("Final model saved at %s", final_checkpoint)

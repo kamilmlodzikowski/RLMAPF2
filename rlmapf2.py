@@ -2,13 +2,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import gymnasium as gym
-import ray
-from ray.rllib.env.env_context import EnvContext
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 import numpy as np
-import time
-from gymnasium import spaces
-from heapq import heappush, heappop
 import os
 import json
 from d_star_lite import DStarLite, OccupancyGridMap, iterative_congestion_d_star
@@ -53,7 +48,7 @@ class RLMAPF(MultiAgentEnv):
         self._map_cycle_seed: Optional[int] = None
         maps_config = self.config.get("maps_names_with_variants") or {}
         self._map_usage_counter: Dict[str, int] = {str(name): 0 for name in maps_config}
-        self.print_map_usage = self.config.get("print_map_usage", True)
+        self.print_map_usage = self.config.get("print_map_usage", False)
 
         # Set seed
         if self.config["seed"] is not None:
@@ -148,7 +143,7 @@ class RLMAPF(MultiAgentEnv):
             "start_goal_on_periphery": False,  # Force spawn on border with mirrored goals
             "cycle_maps_without_replacement": False,
             "shuffle_map_cycle": True,
-            "print_map_usage": True,
+            "print_map_usage": False,
             # Collision priority multipliers (relative: left > bottom > right > top)
             "use_collision_priority_multiplier": True,
             "collision_priority_weights": {
@@ -171,7 +166,7 @@ class RLMAPF(MultiAgentEnv):
     @classmethod
     def _load_map_data(cls, map_path: str) -> Dict[str, Any]:
         if map_path not in cls._MAP_CACHE:
-            with open(map_path, "r") as handle:
+            with open(map_path, "r", encoding="utf-8") as handle:
                 cls._MAP_CACHE[map_path] = json.load(handle)
         return cls._MAP_CACHE[map_path]
 
@@ -433,11 +428,6 @@ class RLMAPF(MultiAgentEnv):
             self._dstar_gif_writer = None
         self._dstar_debug_frame_idx = 0
 
-        # # Reset environment variables
-        # # TODO: REMOVE
-        # self.config["agents_num"] = 8
-        # # TODO: REMOVE
-
         self.steps = 0
         self._agent_ids = set({"agent_" + str(i) for i in range(self.config["agents_num"])})
         self.rewards = {agent: 0 for agent in self._agent_ids}
@@ -564,7 +554,6 @@ class RLMAPF(MultiAgentEnv):
             self._map_cycle_seed = seed
             self._map_cycle_queue = []
             self._current_map_name = None
-        self._map_cycle_queue = []
 
     def get_seed(self):
         """
@@ -880,11 +869,6 @@ class RLMAPF(MultiAgentEnv):
         """
         info_dict: Dict[str, Dict[str, Any]] = dict()
         for agent in self._agent_ids:
-            obstacles_array = np.zeros(self.grid_size, dtype=int)
-            for pos in self.obstacles:
-                obstacles_array[pos] = 1
-
-
             info_dict[agent] = {
                 "current_position": self.agent_positions[agent],
                 "number_of_collisions": self.number_of_collisions[agent],
@@ -1721,18 +1705,18 @@ if __name__ == "__main__":
         "render_config": {
             "title": "RLMAPF2",
             "show_render": False,
-            "save_video": True,
+            "save_video": False,
             "include_legend": True,
             "legend_position": (0, 0),
             "video_path": "render.mp4",
             "video_fps": 10,
             "video_dpi": 300,
             "render_delay": 0.2,
-            "save_frames": True,
+            "save_frames": False,
             "frames_path": "frames/",
         },
         "d_star_debug": {
-            "save_gif": True,
+            "save_gif": False,
             "gif_path": "dstar_debug.gif",
             "gif_fps": 5,
             "save_pngs": False,
@@ -1740,6 +1724,7 @@ if __name__ == "__main__":
         },
         # "seed": 42,
     }
+    enable_planner_debug_visualization = False
 
     print("Initializing environment...")
 
@@ -1755,11 +1740,10 @@ if __name__ == "__main__":
 
     for i in range(1):
         obs, _ = env.reset()
-        # _debug_print_d_star_paths(env, label=f"Initial D* Lite plan (episode {i})")
-        _visualize_env_planner_state(env, save_dir="dstar_env", display=False)
-        _visualize_d_star_iterations(env, save_dir="dstar", pause_seconds=0.5, display=False)
+        if enable_planner_debug_visualization:
+            _visualize_env_planner_state(env, save_dir="dstar_env", display=False)
+            _visualize_d_star_iterations(env, save_dir="dstar", pause_seconds=0.5, display=False)
         total_rewards = {agent: 0 for agent in env.get_agent_ids()}
-        last_terminateds = dict()    
         terminateds = dict()
         truncateds = dict()
         terminateds['__all__'] = False
@@ -1774,13 +1758,6 @@ if __name__ == "__main__":
 
             for agent in env.get_agent_ids():
                 total_rewards[agent] += reward[agent]
-            
-            # env.render(clear=False)
-            # print("Info:", info)
-            # if (any(terminateds.values())):
-            #     print("     terminateds {}".format(terminateds))
-            #     print("Last terminateds {}".format(last_terminateds))
-            last_terminateds = terminateds
         pbar.close()
 
         print("Episode {} finished! Rewards:".format(i), total_rewards)

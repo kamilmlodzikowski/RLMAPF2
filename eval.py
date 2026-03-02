@@ -130,8 +130,9 @@ class EpisodeResult:
 class EnvConfigBuilder:
     """Build env configs for evaluation rollouts and videos."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], repo_root: Path):
         self._config = config
+        self._repo_root = repo_root
         self._base_env = dict(config.get('environment', {}))
         self._paths = dict(config.get('paths', {}))
 
@@ -152,10 +153,10 @@ class EnvConfigBuilder:
         env_config['agents_num'] = agents_num
         env_config['seed'] = seed
 
-        map_root = self._paths.get('map_root', 'maps')
-        if not os.path.isabs(map_root):
-            map_root = os.path.join(os.getcwd(), map_root)
-        env_config['map_path'] = map_root
+        map_root = Path(self._paths.get('map_root', 'maps')).expanduser()
+        if not map_root.is_absolute():
+            map_root = (self._repo_root / map_root).resolve()
+        env_config['map_path'] = str(map_root)
 
         if render_video:
             render_mode = "human"
@@ -494,18 +495,7 @@ def apply_overrides(config: Dict[str, Any], overrides: List[str]) -> Dict[str, A
             current = current[key]
 
         final_key = keys[-1]
-        try:
-            lower_val = value.lower()
-            if lower_val in ("none", "null"):
-                current[final_key] = None
-            elif lower_val in ("true", "false"):
-                current[final_key] = lower_val == "true"
-            elif "." in value:
-                current[final_key] = float(value)
-            else:
-                current[final_key] = int(value)
-        except ValueError:
-            current[final_key] = value
+        current[final_key] = yaml.safe_load(value)
 
     return config
 
@@ -516,7 +506,9 @@ def parse_agent_range(range_str: str) -> range:
         return range_str
     if isinstance(range_str, str):
         if "-" in range_str:
-            start, end = map(int, range_str.split('-'))
+            start, end = map(int, range_str.split('-', 1))
+            if start > end:
+                raise ValueError(f"Invalid agent range (start > end): {range_str}")
             return range(start, end + 1)
         val = int(range_str)
         return range(val, val + 1)
@@ -1157,31 +1149,42 @@ class Evaluator:
         if self._video_best_repeat_per_agent:
             self._video_once_per_agent = True
 
-        self._env_builder = EnvConfigBuilder(self._config)
+        self._env_builder = EnvConfigBuilder(self._config, self._repo_root)
         self._algo_factory = AlgorithmFactory(self._model_config, self._num_gpus)
         self._map_specs, self._multi_map_enabled = self._resolve_map_specs()
 
         self._warn_if_config_mismatch()
 
+    def _resolve_repo_path(self, path_value: Union[str, Path]) -> Path:
+        path_obj = Path(path_value).expanduser()
+        if not path_obj.is_absolute():
+            path_obj = (self._repo_root / path_obj).resolve()
+        return path_obj
+
     def _resolve_results_dir(self, results_dir: Optional[str]) -> Path:
         if results_dir:
             return Path(results_dir).resolve()
-        results_base = Path(self._config.get('paths', {}).get('experiments_root', 'experiments'))
+        results_base = self._resolve_repo_path(
+            self._config.get('paths', {}).get('experiments_root', 'experiments')
+        )
         name_prefix = self._config.get('run', {}).get('name_prefix')
         if name_prefix:
             return (results_base / name_prefix / self._run_name).resolve()
         return (results_base / self._run_name).resolve()
 
-    def _checkpoint_search_roots(self) -> List[Union[str, Path]]:
+    def _checkpoint_search_roots(self) -> List[Path]:
         experiments_root = self._paths_config.get('experiments_root')
         train_experiments_root = self._paths_config.get('train_experiments_root', 'experiments/train')
-        roots: List[Union[str, Path]] = []
+        roots: List[Path] = []
         if experiments_root:
-            roots.append(experiments_root)
-        if train_experiments_root and all(Path(train_experiments_root) != Path(existing) for existing in roots):
-            roots.append(train_experiments_root)
-        if all(Path('experiments') != Path(existing) for existing in roots):
-            roots.append('experiments')
+            roots.append(self._resolve_repo_path(experiments_root))
+        if train_experiments_root:
+            train_root = self._resolve_repo_path(train_experiments_root)
+            if all(train_root != existing for existing in roots):
+                roots.append(train_root)
+        default_root = self._resolve_repo_path('experiments')
+        if all(default_root != existing for existing in roots):
+            roots.append(default_root)
         return roots
 
     def _resolve_map_specs(self) -> Tuple[List[MapSpec], bool]:

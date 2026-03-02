@@ -7,6 +7,7 @@ and manages parallel execution.
 """
 
 import argparse
+import logging
 import shlex
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from ray import tune
 
 
 TRAIN_SCRIPT = Path(__file__).resolve().parent / "train.py"
+LOG_LEVEL = logging.INFO
+logger = logging.getLogger("start_training")
 
 
 def train_with_args(config: dict) -> None:
@@ -32,7 +35,7 @@ def train_with_args(config: dict) -> None:
 def parse_config_file(path: Path) -> list[str]:
     """Return non-empty, non-comment lines from the config file."""
     lines = []
-    with path.open() as f:
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
@@ -41,6 +44,7 @@ def parse_config_file(path: Path) -> list[str]:
 
 
 def main() -> None:
+    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
     parser = argparse.ArgumentParser(description="Launch multiple training runs with Ray Tune")
     parser.add_argument("config_file", type=Path, help="File with one set of args per line")
     parser.add_argument("--max_concurrent_trials", type=int, default=5,
@@ -54,7 +58,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not args.config_file.exists():
+        raise FileNotFoundError(f"Config file not found: {args.config_file}")
     lines = parse_config_file(args.config_file)
+    if not lines:
+        raise ValueError(f"No runnable lines found in {args.config_file}")
 
     # Optionally enforce CNN observation for all trials unless already specified per-line
     if args.use_cnn_observation:
@@ -79,21 +87,24 @@ def main() -> None:
         lines = enforced_lines
 
     ray.init()
-    resources = {"cpu": 4}
-    if args.gpus_per_trial > 0:
-        resources["gpu"] = args.gpus_per_trial
-    trainable = tune.with_resources(train_with_args, resources)
-    tuner = tune.Tuner(
-        trainable,
-        param_space={"args": tune.grid_search(lines)},
-        tune_config=tune.TuneConfig(max_concurrent_trials=args.max_concurrent_trials),
-    )
-    tuner.fit()
+    try:
+        resources = {"cpu": 4}
+        if args.gpus_per_trial > 0:
+            resources["gpu"] = args.gpus_per_trial
+        trainable = tune.with_resources(train_with_args, resources)
+        tuner = tune.Tuner(
+            trainable,
+            param_space={"args": tune.grid_search(lines)},
+            tune_config=tune.TuneConfig(max_concurrent_trials=args.max_concurrent_trials),
+        )
+        tuner.fit()
+    finally:
+        ray.shutdown()
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nKeyboardInterrupt received. Shutting down Ray and cleaning up subprocesses.")
+        logger.warning("KeyboardInterrupt received. Shutting down Ray and cleaning up subprocesses.")
         ray.shutdown()

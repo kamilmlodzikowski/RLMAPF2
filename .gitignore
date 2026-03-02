@@ -1,17 +1,60 @@
-frames/*
-*results*
-*checkpoint*
-*.pkl
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+venv_backup/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Training/evaluation artifacts
+experiments/
+saved_models/
+wandb/
+videos/
+frames/
+dstar/
+dstar_env/
+dstar_debug.gif
+dstar_debug_frames/
+eval_test_results_*/
+mstar_test_results_*/
+*_test_results_*/
+
+# Local model/data artifacts
+weights/
 *.pt
-*.pyc*
+*.pth
+*.pkl
+
+# Logs and temporary files
 *.log
+tmp/
+tmp.py
+paper.tex
+
+# Render and media outputs
 *.mp4
 *.avi
 *.gif
-wandb
-__pycache__
-saved_models/
-experiments/
-dstar/
-.venv/
-paper.tex
+
+# Integration outputs
+integrations/lagat/results/
+
+# Local third-party checkouts (kept outside tracked source by default)
+third_party/

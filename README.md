@@ -1,25 +1,25 @@
 # RLMAPF2
 
-RLMAPF2 trains PPO policies for multi-agent path finding (MAPF) problems with
-optional D* Lite guidance. The project is built on top of Ray RLlib and ships
-with structured experiment configs so you can reproduce runs without editing the
-code.
+RLMAPF2 is a MAPF research codebase for training and evaluating multi-agent PPO
+policies with optional congestion-aware D* Lite guidance.
+
+The core pipeline is config-driven (YAML), reproducible, and built on Ray RLlib.
+
+## Highlights
+
+- Shared-policy PPO training for grid MAPF.
+- Optional D* Lite path guidance injected into local observations.
+- Structured experiment outputs (resolved config, metadata, metrics, checkpoints).
+- Evaluation harness with repeat runs, cross-agent scaling, CSV exports, and optional videos.
+- Batch-run launcher for Ray Tune sweeps.
 
 ## Requirements
 
 - Python 3.9+
-- GPU optional but recommended for larger experiments
-- Python packages (see `requirements.txt` for exact versions):
-  - `ray[rllib]`
-  - `torch`
-  - `gymnasium`
-  - `numpy`
-  - `PyYAML`
-  - `matplotlib`
-  - `tqdm`
-  - `wandb` (optional, disable with `--no-wandb`)
+- Optional GPU for larger experiments
+- Dependencies pinned in `requirements.txt`
 
-Install the dependencies in a virtual environment:
+Quick setup:
 
 ```bash
 python3 -m venv .venv
@@ -28,23 +28,27 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Quick Start
+## Repository Layout
 
-Train a single run using one of the YAML configs in `configs/train/`:
+- `train.py`: single-run PPO training entrypoint
+- `start_training.py`: batch launcher (one config line per trial)
+- `eval.py`: checkpoint evaluation and reporting
+- `rlmapf2.py`: multi-agent environment implementation
+- `configs/train/`: training configs
+- `configs/eval/`: evaluation configs
+- `maps/`: JSON map definitions and map generation helpers
+- `docs/`: extended workflow docs
+- `tests/`: unit tests
+
+## Training
+
+Run a baseline training:
 
 ```bash
 python3 train.py --config baseline
 ```
 
-This command creates `experiments/<run-name>/` containing:
-
-- `config/resolved_config.yaml` and `.json` – exact config used
-- `metrics.jsonl` – episode metrics stored locally
-- `checkpoints/` plus `checkpoints.jsonl` – saved policies and index
-- `run_summary.json` – final checkpoint and best metrics
-- `run_metadata.json` – timestamps, git commit, Ray namespace
-
-Use overrides to adjust parameters without editing files:
+Run with overrides:
 
 ```bash
 python3 train.py --config baseline \
@@ -54,74 +58,83 @@ python3 train.py --config baseline \
 
 Useful flags:
 
-- `--config <name-or-path>` – load config by name (`baseline`, `cnn`, etc.) or an
-  explicit path
-- `--set key=value` – override any nested value using dot notation; repeat as
-  needed
-- `--run-name my-run` – force a specific run directory name
-- `--seed 123` / `--train-seed 123` – set `training.random_seed` (training environment seed). If omitted, a random seed is generated for each run.
-- `--eval-seed 42` – set `training.evaluation_seed` (evaluation environment seed). Defaults to 42 when not provided.
-- `--no-wandb` – disable Weights & Biases logging
+- `--config <name-or-path>`
+- `--set key=value` (repeatable, dot-path syntax)
+- `--run-name <name>`
+- `--train-seed <int>` / `--eval-seed <int>`
+- `--no-wandb`
 
-Legacy arguments (`--agents_num`, `--max_steps`, etc.) still work; they are
-translated into the corresponding overrides.
+Artifacts are written under the configured experiments root
+(default `experiments/train/<run-name>/`), including:
 
-## Batch Experiments with Ray Tune
+- `config/resolved_config.yaml` and `config/resolved_config.json`
+- `metrics.jsonl`
+- `checkpoints/` and `checkpoints.jsonl`
+- `run_metadata.json`
+- `run_summary.json`
 
-`start_training.py` schedules multiple runs using Ray Tune. Define one line per
-trial in `start_training_config.txt` using the same syntax as the single-run
-entrypoint:
+## Batch Training
 
-```shell
+`start_training.py` reads one trial per line from `start_training_config.txt`.
+
+Example line:
+
+```text
 baseline --set environment.agents_num=40 --set training.episodes=800
 ```
 
-Launch the sweep:
+Launch:
 
-```shell
-python3 start_training.py start_training_config.txt \
-  --max_concurrent_trials 2
+```bash
+python3 start_training.py start_training_config.txt --max_concurrent_trials 2
 ```
 
-The `--use_cnn_observation` flag automatically appends
-`--set environment.use_cnn_observation=True` to each trial unless already set.
+## Evaluation
 
-## maps/
+Run evaluation against a checkpoint:
 
-The `maps/` directory contains JSON map files used by the environment. Each map specifies the layout, number of agents, and (optionally) start/goal positions.
-
-To generate new map files programmatically, edit `maps/json_generator_map.txt`
-with your ASCII layout and run the helper script:
-
-```shell
-python3 maps/json_generator.py \
-  --name my_custom_map \
-  --agents 4-4 \
-  --flip_h --rot90
+```bash
+python3 eval.py --config baseline --checkpoint 1
 ```
 
-Flags control optional augmentations (`--flip_*`, `--rot*`, `--translate`,
-`--swap`). Use `--map_txt_file` to point at an alternate ASCII layout. The
-script reads the template, produces variants, previews the JSON, and writes
-`<name>_<agents>a-<width>x<height>.json` into `maps/`.
+- Numeric checkpoints resolve as `1 = most recent`, `2 = second most recent`, etc.
+- Full details and plotting guidance are in `README_eval.md`.
 
-Set `environment.start_goal_on_periphery=true` in a train config (or via
-`--set`) to override any map-provided spawn points. When enabled, agents are
-placed uniformly along the accessible border and their goals are mirrored to
-the diametrically opposite border cell (e.g. `(0, 0)` pairs with
-`(width-1, height-1)`). Ensure the chosen maps have obstacle-free perimeter
-cells; otherwise the run will error during reset.
+## Maps
 
-## Experiment Documentation
+Map files are stored in `maps/*.json`.
 
-`docs/experiments.md` expands on the workflow, including tips for creating new
-YAML configs, interpreting run outputs, and tuning evaluation cadence.
+Generate a map from an ASCII template:
 
-## Testing the Environment Without RL
+```bash
+python3 maps/json_generator.py --name my_map --agents 4-4 --flip_h --rot90
+```
 
-You can step through the `RLMAPF` environment directly to validate map or
-reward changes without launching PPO.
+Use `environment.start_goal_on_periphery=true` to spawn on obstacle-free border
+cells with mirrored goals.
+
+## Local Validation
+
+Run tests:
+
+```bash
+pytest -q tests
+```
+
+Run the environment module directly for manual stepping/debug:
 
 ```bash
 python3 -m rlmapf2
 ```
+
+## Documentation
+
+- `README_eval.md`: evaluation usage and metric interpretation
+- `docs/experiments.md`: config workflow and experiment organization
+- `CONTRIBUTING.md`: contribution process
+- `SECURITY.md`: vulnerability reporting
+- `THIRD_PARTY_NOTICES.md`: external component license notes
+
+## License
+
+This repository is released under the MIT License (`LICENSE`).

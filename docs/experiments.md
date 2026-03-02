@@ -1,72 +1,73 @@
 # Experiment Workflow
 
-This project now uses YAML-based configurations to describe training runs. Each
-config captures the environment, PPO model, logging, and file-system layout so
-you can reproduce an experiment without digging through scripts.
+This repository uses YAML-driven runs so experiments remain reproducible and auditable.
 
-## Single Run
+## Single Training Run
 
 ```bash
 python3 train.py --config baseline
 ```
 
-Useful flags:
+Useful options:
 
-- `--config <name-or-path>`: load a config from `configs/train/` or an explicit
-  path. Examples: `baseline`, `cnn`, or `configs/train/custom.yaml`.
-- `--set key=value`: override any nested value using dot notation. E.g.
-  `--set environment.agents_num=40` or
-  `--set training.eval_interval=25`. Repeat `--set` to change multiple fields.
-- `--run-name custom-name`: override the generated run directory name.
-- `--no-wandb`: disable Weights & Biases even if the config enables it.
-- Legacy Ray tune arguments like `--agents_num` are still accepted and converted
-  into overrides for backwards compatibility.
+- `--config <name-or-path>` from `configs/train/` or explicit YAML
+- `--set key=value` for nested overrides (repeatable)
+- `--run-name <name>` for deterministic output folder names
+- `--train-seed <int>` and `--eval-seed <int>`
+- `--no-wandb` to disable Weights & Biases logging
 
-Each run creates `experiments/<run-name>/` with:
+Default output root is `paths.experiments_root` (typically `experiments/train`):
 
-- `config/` – resolved YAML/JSON config used for the run.
-- `run_metadata.json` – git commit (if available), timestamp, and directories.
-- `metrics.jsonl` – per-episode metrics logged locally.
-- `checkpoints/` – saved policies with an index in `checkpoints.jsonl`.
-- `run_summary.json` – final checkpoint plus best metrics summary.
+- `config/resolved_config.yaml` and `.json`
+- `metrics.jsonl`
+- `checkpoints/` and `checkpoints.jsonl`
+- `run_metadata.json`
+- `run_summary.json`
 
-## Batch Runs with Ray Tune
+## Batch Runs (Ray Tune)
 
-`start_training.py` now reads the same override syntax. Each non-comment line in
-`start_training_config.txt` can be a config name optionally followed by
-`--set ...` overrides. Ray Tune runs a grid search over the lines.
+`start_training.py` reads one trial per line from `start_training_config.txt`.
 
-Example configuration file entry:
+Example line:
 
-```
+```text
 baseline --set environment.agents_num=40 --set training.episodes=800
 ```
 
-Launch multiple runs:
+Run:
 
 ```bash
 python3 start_training.py start_training_config.txt --max_concurrent_trials 2
 ```
 
-Use `--use_cnn_observation` if you want every run to enable the CNN observation
-flag without editing each line; the script appends
-`--set environment.use_cnn_observation=True` when missing.
+Use `--use_cnn_observation` to enforce `environment.use_cnn_observation=True` across all lines unless already set.
+
+## Evaluation Workflow
+
+```bash
+python3 eval.py --config baseline --checkpoint 1
+```
+
+For details on metrics, outputs, and multi-map mode, see `README_eval.md`.
 
 ## Creating New Configs
-
-Copy one of the templates in `configs/train/` and adjust the sections you need:
 
 ```bash
 cp configs/train/baseline.yaml configs/train/my_experiment.yaml
 ```
 
-Key sections:
+Sections to update:
 
-- `run`: naming, wandb project/group, tags.
-- `training`: episode counts, evaluation cadence.
-- `environment`: values forwarded to `RLMAPF`.
-- `evaluation_environment`: overrides for evaluation runs.
-- `logging`: metrics to track locally and in wandb.
+- `run`: naming/logging metadata
+- `hardware`: CPU/GPU and worker counts
+- `model`: RLlib model stack
+- `training`: episode counts, evaluation cadence
+- `environment`: runtime env parameters
+- `evaluation_environment`: eval-only env overrides
+- `paths`: output/map roots
 
-Commit the new config with your experiment results so the history stays
-traceable.
+## Reproducibility Tips
+
+- Keep `resolved_config.yaml` and checkpoint references with result artifacts.
+- Prefer CLI `--set` overrides for small ablations to avoid config drift.
+- Use numeric checkpoint shortcuts (`--checkpoint 1`, `--checkpoint 2`) only when the search roots are stable.

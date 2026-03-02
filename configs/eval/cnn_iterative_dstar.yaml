@@ -53,10 +53,10 @@ environment:
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:
-    pprai_1-20a-42x39: null
+    maze1_1-100a-30x30: null
 logging:
   log_git_info: true
 eval_agents_range: "10-20"
 eval_video_fps: 10
-eval_smooth_motion: true
+eval_smooth_motion: false
 eval_motion_frames: 5

@@ -1,0 +1,73 @@
+maps: [maze4_1-100a-30x30]  # optional: global map override applied to all runs (variants = null)
+video_once_per_agent: true  # optional: when render_video is true, emit only one video per agent count (across repeats)
+video_best_repeat_per_agent: true  # optional: render a single video per agent count using the best repeat
+
+runs:
+
+  - config: baseline
+    checkpoint: 1            # numeric shortcut or full path
+    checkpoint_group: experiments/train/baseline-20260120-234412-7627  # target the intended run dir
+    name_suffix: baseline    # appended to run-name if run_name not set
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true  # align env/model with checkpoint
+    overrides:
+      - eval_agents_range=1-20
+    render_video: false
+
+  - config: cnn
+    checkpoint: 1            # numeric shortcut or full path
+    checkpoint_group: experiments/train/cnn-20260107-080543-8187  # target the intended run dir
+    name_suffix: cnn    # appended to run-name if run_name not set
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true  # align env/model with checkpoint
+    overrides:
+      - eval_agents_range=1-20
+    render_video: false
+
+  - config: cnn_dispersal
+    checkpoint: 1
+    checkpoint_group: experiments/train/cnn_dispersal-20260115-030242-6738
+    name_suffix: cnn_dispersal
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true
+    overrides:
+      - eval_agents_range=1-20
+    render_video: false
+
+  - config: cnn_iterative_dstar
+    checkpoint: 1
+    checkpoint_group: experiments/train/cnn-iterative-dstar-20260107-220209-7787
+    name_suffix: cnn_iterative_dstar
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true
+    overrides:
+      - eval_agents_range=1-20
+    render_video: false
+
+  - config: cnn_periphery
+    checkpoint: 1            # numeric shortcut or full path
+    checkpoint_group: experiments/train/cnn-periphery-20260114-014525-0512
+    name_suffix: cnn_periphery   # appended to run-name if run_name not set
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true  # align env/model with checkpoint
+    overrides:
+      - eval_agents_range=1-20
+    render_video: false
+
+  - config: cnn_congestion_dstar
+    checkpoint: 1            # numeric shortcut or full path
+    checkpoint_group: experiments/train/cnn-congestion-dstar-20260114-023141-0201
+    name_suffix: cnn_congestion_dstar   # appended to run-name if run_name not set
+    repeats: 5
+    num_threads: 2
+    sync_train_config: true  # align env/model with checkpoint
+    overrides:
+      - eval_agents_range=1-20
+    render_video: false
+    # video_once_per_agent: true        # uncomment to override the global default for this run only
+    # video_best_repeat_per_agent: true # uncomment to override the global default for this run only

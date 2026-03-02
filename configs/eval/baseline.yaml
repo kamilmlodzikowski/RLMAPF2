@@ -48,7 +48,8 @@ environment:
   render_mode: rgb_array
   render_delay: 0.01
   maps_names_with_variants:
-    big_empty_1-100a-20x20: null
+    maze4_1-100a-30x30: null
+eval_sync_train_config: true  # auto-sync env/model with checkpoint training config
 logging:
   log_git_info: true
 # Evaluation settings (custom fields)

@@ -1,5 +1,5 @@
 run:
-  name_prefix: cnn
+  name_prefix: cnn_dispersal
   project: rlmapf_iterative_dstar_dispersal
   group: cnn_iterative_baseline
   use_wandb: true
@@ -36,7 +36,7 @@ training:
   evaluation_seed: null
 paths:
   save_dir: saved_models
-  experiments_root: experiments
+  experiments_root: experiments/train
   map_root: maps
 environment:
   agents_num: 20
@@ -75,7 +75,7 @@ environment:
     maze3_1-100a-30x30: null
     maze4_1-100a-30x30: null
     pprai_1-20a-42x39: null
-    warehouse0_1-10a-21x21: null
+    Hailway_Grid_1-20a-45x42.json: null
 evaluation_environment:
   agents_num: 10
   max_steps: 250

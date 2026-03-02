@@ -45,26 +45,31 @@ environment:
   maps_names_with_variants:
     big_empty_1-100a-20x20: null  # Will be overridden by eval_maps
 
+eval_sync_train_config: true  # auto-sync eval env/model with the checkpoint's training config
+
 # Multi-map evaluation configuration
 eval_maps:
   enabled: true
   maps:
-    - name: big_empty_1-100a-20x20
+    - name: basic3_1-100a-45x35
       variants: null
-      label: "Empty 20x20"
+      label: "Basic3"
     - name: pprai_1-20a-42x39
       variants: null
       label: "Warehouse"
-    - name: corridors_10-10a-32x32
+    - name: big_empty_1-100a-20x20
       variants: null
-      label: "Corridors"
+      label: "Big_empty"
+    - name: maze4_1-100a-30x30
+      variants: null
+      label: "Maze3"
   aggregate_results: true
   generate_comparison_plots: true
 
 # Evaluation parameters
-eval_agents_range: "4-10"
+eval_agents_range: "1-20"
 eval_repeats: 10
 eval_num_threads: 2
 eval_video_fps: 10
-eval_smooth_motion: true  # Enable smooth agent motion in videos
+eval_smooth_motion: false  # Enable smooth agent motion in videos
 eval_motion_frames: 5     # Number of interpolation frames per step (higher = smoother but larger file)

@@ -1152,6 +1152,7 @@ class Evaluator:
         self._env_builder = EnvConfigBuilder(self._config, self._repo_root)
         self._algo_factory = AlgorithmFactory(self._model_config, self._num_gpus)
         self._map_specs, self._multi_map_enabled = self._resolve_map_specs()
+        self._validate_agent_range_against_maps()
 
         self._warn_if_config_mismatch()
 
@@ -1210,6 +1211,70 @@ class Evaluator:
             label=current_map,
         )
         return [map_spec], False
+
+    def _map_file_path(self, map_name: str) -> Path:
+        map_root = self._resolve_repo_path(self._paths_config.get('map_root', 'maps'))
+        filename = map_name if str(map_name).endswith(".json") else f"{map_name}.json"
+        return map_root / filename
+
+    def _map_agent_limits(self, map_name: str) -> Optional[Tuple[int, int]]:
+        map_path = self._map_file_path(map_name)
+        if not map_path.exists():
+            raise ValueError(f"Map file not found: {map_path}")
+        try:
+            with map_path.open("r", encoding="utf-8") as handle:
+                map_data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Map file is not valid JSON: {map_path}") from exc
+
+        metadata = map_data.get("metadata", {})
+        min_agents = metadata.get("min_num_of_agents")
+        max_agents = metadata.get("max_num_of_agents")
+        if min_agents is None or max_agents is None:
+            return None
+        try:
+            return int(min_agents), int(max_agents)
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_agent_range_against_maps(self) -> None:
+        selected_agents = list(self._agents_range)
+        if not selected_agents:
+            raise ValueError("Agent range resolved to an empty set.")
+
+        for map_spec in self._map_specs:
+            limits = self._map_agent_limits(map_spec.name)
+            if limits is None:
+                continue
+            min_agents, max_agents = limits
+            invalid = [value for value in selected_agents if value < min_agents or value > max_agents]
+            if not invalid:
+                continue
+
+            if len(invalid) == len(selected_agents):
+                raise ValueError(
+                    "Agent range {} is incompatible with map '{}' (supported [{}-{}]). "
+                    "Adjust --set eval_agents_range=..., choose a different map/config, "
+                    "or use --clamp-agents-to-train.".format(
+                        f"{selected_agents[0]}-{selected_agents[-1]}",
+                        map_spec.name,
+                        min_agents,
+                        max_agents,
+                    )
+                )
+
+            preview = invalid[:5]
+            suffix = "..." if len(invalid) > 5 else ""
+            raise ValueError(
+                "Agent range includes unsupported values for map '{}' (supported [{}-{}]); "
+                "invalid values: {}{}".format(
+                    map_spec.name,
+                    min_agents,
+                    max_agents,
+                    preview,
+                    suffix,
+                )
+            )
 
     def _warn_if_config_mismatch(self) -> None:
         train_config = self._train_config or _load_training_config_from_checkpoint(self._checkpoint_path)
